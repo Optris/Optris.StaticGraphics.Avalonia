@@ -257,7 +257,7 @@ jobs:
           PY
 
       - name: 🏗️ Compile smoke project
-        run: dotnet build Smoke/AvaloniaStaticLinkSmoke/AvaloniaStaticLinkSmoke.csproj -c Release -p:PublishAot=false
+        run: dotnet build Smoke/OptrisStaticGraphicsSmoke/OptrisStaticGraphicsSmoke.csproj -c Release -p:PublishAot=false
 
   upstream:
     name: 🌐 Upstream refs & ANGLE patch

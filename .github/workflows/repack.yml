@@ -140,15 +140,24 @@ jobs:
             artifacts/nuget/*.snupkg
           if-no-files-found: error
 
+      # Trusted Publishing, same as release.yml - no stored key. See the note there: policies are
+      # per workflow file, so publishing from repack.yml needs its own policy naming repack.yml.
+      - name: 🔑 NuGet login (OIDC)
+        if: ${{ inputs.publish_to_nuget == true }}
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: ${{ vars.NUGET_USER || 'saitz-optris' }}
+
       - name: 🚀 Push to nuget.org
         if: ${{ inputs.publish_to_nuget == true }}
         working-directory: artifacts/nuget
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: |
           set -euo pipefail
           if [ -z "${NUGET_API_KEY:-}" ]; then
-            echo "::error::NUGET_API_KEY is not configured for this repository."
+            echo "::error::The OIDC exchange returned no key. nuget.org policies are per workflow file - check one exists naming repack.yml, or repack through release.yml."
             exit 1
           fi
           dotnet nuget push "*.nupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate

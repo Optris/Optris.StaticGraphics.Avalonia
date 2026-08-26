@@ -184,6 +184,16 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: read
+    env:
+      RID: ${{ matrix.rid }}
+      # This package carries libAvaloniaNative.a, not a graphics tier, so the app links the ordinary
+      # dynamic SkiaSharp. Avalonia has no Vulkan backend on macOS either way, which makes OpenGL the
+      # richest thing there is to force here; Software comes with it because the tiers nest.
+      SMOKE_TIER: OpenGL
+      SMOKE_BACKENDS: OpenGL Software
+      SMOKE_DIR: artifacts/smoke-${{ matrix.rid }}
+      SMOKE_LOG_DIR: artifacts/smoke-logs/${{ matrix.rid }}
+      SMOKE_LABEL: AvaloniaNative on ${{ matrix.rid }}
     steps:
       - name: 🛒 Checkout
         uses: actions/checkout@v6
@@ -207,9 +217,10 @@ jobs:
           pwsh ./scripts/create-avalonia-smoke.ps1 `
             -ProjectDir $projectDir `
             -NuGetSource (Resolve-Path "artifacts/nuget") `
+            -Tier "$env:SMOKE_TIER" `
             -AvaloniaVersion "${{ needs.detect.outputs.avalonia_version }}" `
             -AvaloniaNativeVersion "${{ needs.detect.outputs.package_version }}"
-          dotnet publish (Join-Path $projectDir "AvaloniaStaticLinkSmoke.csproj") `
+          dotnet publish (Join-Path $projectDir "OptrisStaticGraphicsSmoke.csproj") `
             -c Release `
             -r "${{ matrix.rid }}" `
             --configfile (Join-Path $projectDir "NuGet.config") `
@@ -220,37 +231,27 @@ jobs:
         run: |
           set -euo pipefail
           test ! -f "artifacts/smoke-${{ matrix.rid }}/libAvaloniaNative.dylib"
-          test -x "artifacts/smoke-${{ matrix.rid }}/AvaloniaStaticLinkSmoke"
+          test -x "artifacts/smoke-${{ matrix.rid }}/OptrisStaticGraphicsSmoke"
 
-      - name: ▶️ Run Avalonia smoke app
+      # The exit code is the whole verdict. The wrapper that used to treat surviving fifteen seconds
+      # as success is gone: a window that never paints survives just as long.
+      - name: ▶️ Smoke the app, once per backend
         shell: bash
-        run: |
-          set -euo pipefail
-          cd "artifacts/smoke-${{ matrix.rid }}"
-          python3 - <<'PY'
-          import subprocess
-          import sys
+        run: sh scripts/run-smoke.sh
 
-          proc = subprocess.Popen(
-              ["./AvaloniaStaticLinkSmoke"],
-              stdout=subprocess.PIPE,
-              stderr=subprocess.STDOUT,
-              text=True,
-          )
-          try:
-              output, _ = proc.communicate(timeout=15)
-          except subprocess.TimeoutExpired:
-              proc.kill()
-              output, _ = proc.communicate()
-              print(output or "")
-              print("Smoke app stayed alive for 15 seconds.")
-              sys.exit(0)
+      - name: 🧪 Prove the smoke test can fail
+        shell: bash
+        env:
+          SMOKE_SELFTEST: "1"
+        run: sh scripts/run-smoke.sh
 
-          print(output or "")
-          if proc.returncode == 0:
-              sys.exit(0)
-          sys.exit(proc.returncode if proc.returncode > 0 else 1)
-          PY
+      - name: 📤 Upload smoke frames and reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-evidence-${{ matrix.rid }}
+          path: artifacts/smoke-logs/${{ matrix.rid }}/**
+          if-no-files-found: warn
 
   publish:
     name: 🚀 Publish to nuget.org
@@ -274,14 +275,25 @@ jobs:
           name: nuget-avalonia-native
           path: artifacts/nuget
 
+      # Publishing uses Trusted Publishing, so there is no stored key anywhere in this repository.
+      # NOTE the policy on nuget.org names ONE workflow file. If only release.yml is registered,
+      # this exchange fails by design and the fix is either to add a second policy naming
+      # avalonia-native.yml, or to publish this package through release.yml instead. Failing
+      # closed is the intended behaviour: an unregistered workflow must not be able to publish.
+      - name: 🔑 NuGet login (OIDC)
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: ${{ vars.NUGET_USER || 'saitz-optris' }}
+
       - name: 🚀 Push
         working-directory: artifacts/nuget
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: |
           set -euo pipefail
           if [ -z "${NUGET_API_KEY:-}" ]; then
-            echo "::error::NUGET_API_KEY is not configured for this repository."
+            echo "::error::The OIDC exchange returned no key. nuget.org policies are per workflow file - check one exists naming avalonia-native.yml, or publish this package through release.yml."
             exit 1
           fi
           dotnet nuget push "*.nupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate

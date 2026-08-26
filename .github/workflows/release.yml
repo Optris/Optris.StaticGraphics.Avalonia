@@ -463,11 +463,16 @@ jobs:
         with:
           arch: ${{ matrix.msvc_arch }}
 
-      - name: 🧰 Install Linux publish dependencies
+      - name: 🧰 Install Linux publish and run dependencies
         if: ${{ startsWith(matrix.rid, 'linux-') && !startsWith(matrix.rid, 'linux-musl-') }}
         run: |
           sudo apt-get update
-          sudo apt-get install -y clang lld xvfb zlib1g-dev libfontconfig1-dev libfreetype6 libgl1 libice6 libsm6 libx11-6 libxcb1 libxcursor1 libxext6 libxfixes3 libxinerama1 libxrandr2 libxrender1 libxi6
+          # mesa-vulkan-drivers is lavapipe, a software Vulkan ICD. The runner has no GPU and the
+          # failure under test does not need one: Avalonia hands Skia a real VkDevice either way, and
+          # a Skia built without Vulkan still answers with a null GRContext.
+          sudo apt-get install -y clang lld xvfb zlib1g-dev libfontconfig1-dev libfreetype6 fonts-dejavu-core \
+            libgl1 libgl1-mesa-dri libegl1 libvulkan1 mesa-vulkan-drivers \
+            libice6 libsm6 libx11-6 libxcb1 libxcursor1 libxext6 libxfixes3 libxinerama1 libxrandr2 libxrender1 libxi6
 
       - name: 🟣 Setup .NET
         uses: actions/setup-dotnet@v5
@@ -481,6 +486,41 @@ jobs:
           path: artifacts/nuget
           merge-multiple: true
 
+      - name: 🧭 What this tier has to be proven with
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Each tier is a strict superset of the one below it, so a tier is only proven once every
+          # backend it promises has drawn the picture. Asking for a backend a tier does not carry is
+          # exit 3 from the app rather than a failure, so the list is derived and never guessed.
+          case "$TIER" in
+            Vulkan)   backends="Vulkan OpenGL Software" ;;
+            OpenGL)   backends="OpenGL Software" ;;
+            Software) backends="Software" ;;
+            *) echo "::error::Unknown tier '$TIER'."; exit 1 ;;
+          esac
+
+          # Avalonia has no Vulkan backend on macOS, and the app refuses such a run with exit 3 rather
+          # than accepting Metal in its place; a Vulkan tier is proven there by its other two backends.
+          case "$RID" in
+            osx-*) backends="$(printf '%s\n' $backends | grep -vx Vulkan | tr '\n' ' ' || true)" ;;
+          esac
+
+          launcher=""
+          case "$RID" in
+            linux-*) launcher="xvfb-run -a" ;;
+          esac
+
+          {
+            echo "SMOKE_TIER=$TIER"
+            echo "SMOKE_BACKENDS=$(echo $backends)"
+            echo "SMOKE_LABEL=$TIER on $RID"
+            echo "SMOKE_DIR=artifacts/smoke-$TIER-$RID"
+            echo "SMOKE_LOG_DIR=artifacts/smoke-logs/$TIER-$RID"
+            echo "SMOKE_LAUNCHER=$launcher"
+          } >> "$GITHUB_ENV"
+          echo "$TIER on $RID will be proven with: $backends"
+
       - name: 🔥 Publish single-file smoke app
         if: ${{ !startsWith(matrix.rid, 'linux-musl-') }}
         shell: pwsh
@@ -493,7 +533,7 @@ jobs:
             -Tier "$env:TIER" `
             -PackageVersion "$env:PACKAGE_VERSION" `
             -AvaloniaVersion "$env:AVALONIA_SMOKE_VERSION"
-          dotnet publish (Join-Path $projectDir "AvaloniaStaticLinkSmoke.csproj") `
+          dotnet publish (Join-Path $projectDir "OptrisStaticGraphicsSmoke.csproj") `
             -c Release `
             -r "$env:RID" `
             --configfile (Join-Path $projectDir "NuGet.config") `
@@ -519,7 +559,7 @@ jobs:
             -v "${{ github.workspace }}:/workspace" `
             -w /workspace `
             "${{ env.DOTNET_ALPINE_IMAGE }}" `
-            sh -c "apk add --no-cache clang lld build-base zlib-dev fontconfig-dev && dotnet publish /workspace/artifacts/avalonia-smoke-src/AvaloniaStaticLinkSmoke.csproj -c Release -r $env:RID --configfile /workspace/artifacts/avalonia-smoke-src/NuGet.config /p:PublishAot=true /p:SelfContained=true /p:PublishSingleFile=true /p:StripSymbols=true /p:PublishDir=/workspace/artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/"
+            sh -c "apk add --no-cache clang lld build-base zlib-dev fontconfig-dev && dotnet publish /workspace/artifacts/avalonia-smoke-src/OptrisStaticGraphicsSmoke.csproj -c Release -r $env:RID --configfile /workspace/artifacts/avalonia-smoke-src/NuGet.config /p:PublishAot=true /p:SelfContained=true /p:PublishSingleFile=true /p:StripSymbols=true /p:PublishDir=/workspace/artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/"
 
       - name: ✅ Verify no dynamic graphics libraries remain
         shell: pwsh
@@ -540,7 +580,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
-          $app = Join-Path $PWD "artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/AvaloniaStaticLinkSmoke.exe"
+          $app = Join-Path $PWD "artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/OptrisStaticGraphicsSmoke.exe"
           $expectedMachine = @{
             "win-x64" = "8664 machine"
             "win-x86" = "14C machine"
@@ -551,38 +591,21 @@ jobs:
             throw "Expected $expectedMachine in PE headers for $app.`n$headers"
           }
 
-      - name: ▶️ Run Windows smoke app
-        if: ${{ matrix.rid == 'win-x64' || matrix.rid == 'win-x86' }}
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $publishDir = Join-Path $PWD "artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}"
-          $app = Join-Path $publishDir "AvaloniaStaticLinkSmoke.exe"
-          $process = Start-Process -FilePath $app -WorkingDirectory $publishDir -PassThru
-          if ($process.WaitForExit(15000)) {
-            if ($process.ExitCode -eq 0) {
-              Write-Host "Smoke app exited normally."
-              exit 0
-            }
-            throw "Smoke app failed with exit code $($process.ExitCode)."
-          }
-          Stop-Process -Id $process.Id -Force
-          Write-Host "Smoke app stayed alive for 15 seconds."
-
-      - name: ▶️ Run Linux smoke app
-        if: ${{ startsWith(matrix.rid, 'linux-') && !startsWith(matrix.rid, 'linux-musl-') }}
+      # Windows, Linux and macOS all run the same script, so one check covers three platforms. The
+      # app's exit code is the whole verdict: there is deliberately no "it was still running, so it
+      # must be fine" branch, because a process that stays alive is precisely what the blank window
+      # this repository exists to catch looks like. That branch is how the defect shipped upstream.
+      - name: ▶️ Smoke the app, once per backend the tier promises
+        if: ${{ !startsWith(matrix.rid, 'linux-musl-') && matrix.rid != 'win-arm64' }}
         shell: bash
-        run: |
-          set +e
-          cd "artifacts/smoke-$TIER-$RID"
-          chmod +x ./AvaloniaStaticLinkSmoke
-          timeout 15s xvfb-run -a ./AvaloniaStaticLinkSmoke
-          code=$?
-          if [ "$code" = 124 ] || [ "$code" = 143 ]; then
-            echo "Smoke app stayed alive for 15 seconds."
-            exit 0
-          fi
-          exit "$code"
+        run: sh scripts/run-smoke.sh
+
+      - name: 🧪 Prove the smoke test can fail
+        if: ${{ !startsWith(matrix.rid, 'linux-musl-') && matrix.rid != 'win-arm64' }}
+        shell: bash
+        env:
+          SMOKE_SELFTEST: "1"
+        run: sh scripts/run-smoke.sh
 
       - name: ✅ Verify musl ELF dependencies
         if: ${{ startsWith(matrix.rid, 'linux-musl-') }}
@@ -592,58 +615,47 @@ jobs:
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
             -w /workspace \
-            -e APP="artifacts/smoke-$TIER-$RID/AvaloniaStaticLinkSmoke" \
+            -e APP="artifacts/smoke-$TIER-$RID/OptrisStaticGraphicsSmoke" \
             alpine:3.23 \
             sh -c 'apk add --no-cache binutils pax-utils && readelf -l "$APP" | grep "Requesting program interpreter: /lib/ld-musl-" && scanelf -n "$APP" && ! scanelf -n "$APP" | grep -E "ld-linux|ld64.so"'
 
-      - name: ▶️ Run musl smoke app
+      # One container for both phases: the apk install costs far more than either run does, and a
+      # negative control that is skipped whenever the real runs fail is not a control at all.
+      - name: ▶️ Smoke the musl app per backend, then prove it can fail
         if: ${{ startsWith(matrix.rid, 'linux-musl-') }}
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p "artifacts/smoke-logs/$TIER-$RID"
           docker run --rm \
             -v "${{ github.workspace }}:/workspace" \
-            -w "/workspace/artifacts/smoke-$TIER-$RID" \
+            -w /workspace \
+            -e SMOKE_TIER \
+            -e SMOKE_BACKENDS \
+            -e SMOKE_LABEL \
+            -e SMOKE_DIR="/workspace/artifacts/smoke-$TIER-$RID" \
+            -e SMOKE_LOG_DIR="/workspace/artifacts/smoke-logs/$TIER-$RID" \
+            -e SMOKE_LAUNCHER="xvfb-run -a" \
             alpine:3.23 \
-            sh -c 'apk add --no-cache xvfb-run libstdc++ libgcc fontconfig freetype ttf-dejavu libx11 libxcb libxext libxrender libxi libxrandr libxcursor libxfixes libxinerama libice libsm mesa-gl mesa-egl && fc-cache -f && fc-match sans && chmod +x ./AvaloniaStaticLinkSmoke && timeout 15s xvfb-run -a ./AvaloniaStaticLinkSmoke || code=$?; if [ "${code:-0}" = 124 ] || [ "${code:-0}" = 143 ]; then echo "Smoke app stayed alive for 15 seconds."; exit 0; fi; exit "${code:-0}"'
+            sh -c 'apk add --no-cache xvfb-run libstdc++ libgcc fontconfig freetype ttf-dejavu \
+                     libx11 libxcb libxext libxrender libxi libxrandr libxcursor libxfixes libxinerama libice libsm \
+                     mesa-gl mesa-egl mesa-dri-gallium mesa-vulkan-swrast vulkan-loader || exit 1
+                   fc-cache -f || exit 1
+                   fc-match sans || exit 1
+                   status=0
+                   sh /workspace/scripts/run-smoke.sh || status=1
+                   SMOKE_SELFTEST=1 sh /workspace/scripts/run-smoke.sh || status=1
+                   exit $status'
 
-      - name: ▶️ Run macOS smoke app
-        if: ${{ startsWith(matrix.rid, 'osx-') }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          cd "artifacts/smoke-$TIER-$RID"
-          chmod +x ./AvaloniaStaticLinkSmoke
-          python3 - <<'PY'
-          import pathlib
-          import subprocess
-          import sys
-
-          log = pathlib.Path("avalonia-smoke-run.log")
-          proc = subprocess.Popen(
-              ["./AvaloniaStaticLinkSmoke"],
-              stdout=subprocess.PIPE,
-              stderr=subprocess.STDOUT,
-              text=True,
-          )
-          try:
-              output, _ = proc.communicate(timeout=15)
-          except subprocess.TimeoutExpired:
-              proc.kill()
-              output, _ = proc.communicate()
-              log.write_text(output or "")
-              print(output or "")
-              print("Smoke app stayed alive for 15 seconds.")
-              sys.exit(0)
-
-          log.write_text(output or "")
-          print(output or "")
-          if proc.returncode == 0:
-              print("Smoke app exited normally.")
-              sys.exit(0)
-          print(f"Smoke app failed with exit code {proc.returncode}.", file=sys.stderr)
-          sys.exit(proc.returncode if proc.returncode > 0 else 1)
-          PY
+      # A blank frame is the evidence, so the frames and the reports go up whether the job passed or
+      # failed - a red run without the picture it read back is just an assertion nobody can check.
+      - name: 📤 Upload smoke frames and reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-evidence-${{ matrix.tier }}-${{ matrix.rid }}
+          path: artifacts/smoke-logs/${{ matrix.tier }}-${{ matrix.rid }}/**
+          if-no-files-found: warn
 
       - name: 📤 Upload smoke app
         uses: actions/upload-artifact@v7
@@ -656,6 +668,15 @@ jobs:
     name: 🚀 Publish to nuget.org
     runs-on: ubuntu-24.04
     timeout-minutes: 20
+    # Trusted Publishing: nuget.org trusts a short-lived OIDC token from this exact repository and
+    # workflow file instead of a stored key, so there is no long-lived credential to leak, rotate,
+    # or replay out of a log. id-token: write is what lets the job ask GitHub for that token; the
+    # policy on nuget.org is pinned to owner/repo IDs, so deleting and recreating a repo of the
+    # same name cannot inherit the trust. Renaming THIS FILE breaks publishing until the policy's
+    # "Workflow File" is updated to match.
+    permissions:
+      id-token: write
+      contents: read
     needs:
       - pack
       - pack-avalonia-native
@@ -675,14 +696,23 @@ jobs:
           path: artifacts/nuget
           merge-multiple: true
 
+      # Immediately before the push, deliberately: the key nuget.org hands back is valid for one
+      # hour, and one OIDC token buys exactly one key. Requesting it any earlier in the job just
+      # spends part of that hour waiting.
+      - name: 🔑 NuGet login (OIDC)
+        uses: NuGet/login@v1
+        id: nuget-login
+        with:
+          user: ${{ vars.NUGET_USER || 'saitz-optris' }}
+
       - name: 🚀 Push
         working-directory: artifacts/nuget
         env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+          NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
         run: |
           set -euo pipefail
           if [ -z "${NUGET_API_KEY:-}" ]; then
-            echo "::error::NUGET_API_KEY is not configured for this repository."
+            echo "::error::The OIDC exchange returned no key. Check the Trusted Publishing policy on nuget.org matches owner Optris, repository Optris.StaticGraphics.Avalonia and workflow file release.yml, and that the login user is the nuget.org profile name."
             exit 1
           fi
           ls -la
