@@ -219,6 +219,7 @@ jobs:
           bash -n scripts/build-macos-static-graphics.sh
           bash -n scripts/build-macos-avalonia-native-static.sh
           bash -n scripts/build-macos-font-preinit.sh
+          bash -n scripts/run-smoke.sh
           pwsh -NoProfile -Command '
             $failed = $false
             foreach ($file in Get-ChildItem scripts -Filter *.ps1) {
@@ -258,6 +259,61 @@ jobs:
 
       - name: 🏗️ Compile smoke project
         run: dotnet build Smoke/OptrisStaticGraphicsSmoke/OptrisStaticGraphicsSmoke.csproj -c Release -p:PublishAot=false
+
+  smoke-harness:
+    name: 🧪 Smoke harness
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🧰 Install a display and the font stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xvfb fonts-dejavu-core libfontconfig1 libfreetype6             libice6 libsm6 libx11-6 libxcb1 libxcursor1 libxext6 libxfixes3 libxi6 libxinerama1 libxrandr2 libxrender1
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: 🏗️ Build the smoke app
+        run: dotnet build Smoke/OptrisStaticGraphicsSmoke/OptrisStaticGraphicsSmoke.csproj -c Release -p:PublishAot=false -o artifacts/smoke-harness
+
+      # No tier package is linked here, so this exercises the harness rather than a static build:
+      # the Software backend through the ordinary dynamic SkiaSharp. The release workflow is what
+      # forces Vulkan and OpenGL against the packages themselves.
+      - name: ✅ A drawn frame passes
+        env:
+          SMOKE_TIER: Software
+          SMOKE_BACKENDS: Software
+          SMOKE_DIR: artifacts/smoke-harness
+          SMOKE_LOG_DIR: artifacts/smoke-logs/preflight
+          SMOKE_LABEL: preflight harness
+          SMOKE_LAUNCHER: xvfb-run -a
+        run: sh scripts/run-smoke.sh
+
+      # The other half of the same claim, and the one that is easy to lose: a smoke test nobody has
+      # watched fail is not evidence. A blank frame has to come back non-zero.
+      - name: 🧪 A blank frame fails
+        env:
+          SMOKE_TIER: Software
+          SMOKE_BACKENDS: Software
+          SMOKE_DIR: artifacts/smoke-harness
+          SMOKE_LOG_DIR: artifacts/smoke-logs/preflight
+          SMOKE_LABEL: preflight harness
+          SMOKE_LAUNCHER: xvfb-run -a
+          SMOKE_SELFTEST: "1"
+        run: sh scripts/run-smoke.sh
+
+      - name: 📤 Upload the frame and the reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-harness-evidence
+          path: artifacts/smoke-logs/preflight/**
+          if-no-files-found: warn
 
   upstream:
     name: 🌐 Upstream refs & ANGLE patch

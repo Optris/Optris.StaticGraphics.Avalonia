@@ -75,6 +75,28 @@ OPTRIS_SMOKE_SELFTEST=blank ./OptrisStaticGraphicsSmoke && echo "the checks have
 Running one of these in CI keeps the assertions honest. A drawn window and a blank window have to
 produce different verdicts; that is the entire point of the app, and this is how it is proven.
 
+## In CI
+
+`scripts/run-smoke.sh` is what the workflows call, on Windows, Linux, macOS and inside the Alpine
+container alike, so one implementation decides all four. It runs the app once per backend in
+`SMOKE_BACKENDS` and fails if any of them returns anything but 0 - there is no branch anywhere that
+reads liveness as success. `SMOKE_SELFTEST=1` runs the negative control instead, through the
+cheapest backend the tier carries, and fails if the app comes back green.
+
+| Variable | Meaning |
+| --- | --- |
+| `SMOKE_TIER` | the tier under test |
+| `SMOKE_BACKENDS` | space separated backends to force, richest first |
+| `SMOKE_DIR` | directory holding the published app |
+| `SMOKE_LOG_DIR` | where the frame BMPs and the reports are written, and what CI uploads |
+| `SMOKE_LAUNCHER` | command prefix, `xvfb-run -a` where there is no display |
+| `SMOKE_LABEL` | what to call the run in the log |
+| `SMOKE_TIMEOUT` | watchdog seconds handed to the app, default 60 |
+| `SMOKE_SELFTEST` | `1` to run the negative control instead |
+
+The frames and reports upload on every run, including failures: a blank frame is the evidence, and a
+red build without the picture it read back is an assertion nobody else can check.
+
 ## Building it
 
 `scripts/create-avalonia-smoke.ps1` copies this project next to a local package feed and writes the
