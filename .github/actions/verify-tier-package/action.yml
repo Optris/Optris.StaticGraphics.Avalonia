@@ -1,0 +1,110 @@
+name: Verify tier package
+description: Assert that a packed .nupkg publishes the shared tier contract and ships exactly the right archives.
+
+inputs:
+  tier:
+    description: Vulkan, OpenGL or Software
+    required: true
+  package:
+    description: Path to the .nupkg
+    required: true
+  angle_branch:
+    description: Chromium branch the ANGLE archives came from
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: ✅ Verify package contract
+      shell: bash
+      env:
+        TIER: ${{ inputs.tier }}
+        PACKAGE: ${{ inputs.package }}
+        ANGLE_BRANCH: ${{ inputs.angle_branch }}
+      run: |
+        python3 - <<'PY'
+        import os
+        import pathlib
+        import sys
+        import xml.etree.ElementTree as ET
+        import zipfile
+
+        tier = os.environ["TIER"]
+        angle_branch = os.environ["ANGLE_BRANCH"]
+        package_id = f"Optris.StaticGraphics.Avalonia.{tier}"
+        expected_backends = {
+            "Vulkan": {"Vulkan", "OpenGL", "Software"},
+            "OpenGL": {"OpenGL", "Software"},
+            "Software": {"Software"},
+        }[tier]
+
+        path = pathlib.Path(os.environ["PACKAGE"])
+        if not path.is_file():
+            sys.exit(f"::error::{path} does not exist")
+        if not path.name.startswith(f"{package_id}."):
+            sys.exit(f"::error::{path.name} is not a {package_id} package")
+
+        failures = []
+        with zipfile.ZipFile(path) as archive:
+            names = archive.namelist()
+            if any("\\" in name for name in names):
+                failures.append("package contains Windows-only backslash paths")
+
+            props = f"buildTransitive/{package_id}.props"
+            targets = f"buildTransitive/{package_id}.targets"
+            for entry in (props, targets):
+                if entry not in names:
+                    failures.append(
+                        f"missing {entry}: NuGet only auto-imports buildTransitive files named "
+                        "after the package id, so the consumer would silently import nothing"
+                    )
+
+            if props in names:
+                root = ET.fromstring(archive.read(props))
+                declared = {
+                    element.tag.split("}")[-1]: (element.text or "").strip()
+                    for element in root.iter()
+                }
+                contract = {
+                    "OptrisStaticGraphicsTier": tier,
+                    "OptrisStaticGraphicsHasVulkan": str(tier == "Vulkan").lower(),
+                    "OptrisStaticGraphicsHasAngle": str(tier in ("Vulkan", "OpenGL")).lower(),
+                }
+                if tier != "Software":
+                    contract["OptrisStaticGraphicsAngleBranch"] = angle_branch
+                for key, expected in contract.items():
+                    if key not in declared:
+                        failures.append(f"{props} does not publish {key}")
+                    elif declared[key].lower() != expected.lower():
+                        failures.append(f"{props}: {key} is {declared[key]!r}, expected {expected!r}")
+                backends = declared.get("OptrisStaticGraphicsBackends")
+                if backends is None:
+                    failures.append(f"{props} does not publish OptrisStaticGraphicsBackends")
+                elif {item for item in backends.split(";") if item} != expected_backends:
+                    failures.append(
+                        f"{props}: backends are {backends!r}, expected {';'.join(sorted(expected_backends))}"
+                    )
+
+            # The package is what consumers actually get, so presence and absence are asserted
+            # here too and not only on the payload directory the pack step assembled.
+            windows_rids = ["win-x64", "win-x86", "win-arm64"]
+            unix_rids = ["linux-x64", "linux-arm64", "linux-musl-x64", "linux-musl-arm64", "osx-x64", "osx-arm64"]
+            angle_stems = ("libANGLE_static.", "libGLESv2_static.")
+            for rid in windows_rids + unix_rids:
+                entries = [name for name in names if f"/{rid}/" in name]
+                skia = "skia.lib" if rid in windows_rids else "libskia.a"
+                if not any(name.endswith(f"/{rid}/native/{skia}") for name in entries):
+                    failures.append(f"package ships no {skia} for {rid}")
+                if rid == "win-x86" and not any(name.endswith("/win-x86/native/skia_x86_stdcall_thunks.lib") for name in entries):
+                    failures.append("package ships no skia_x86_stdcall_thunks.lib for win-x86")
+                angle = [name for name in entries if name.rsplit("/", 1)[-1].startswith(angle_stems)]
+                allowed = tier in ("Vulkan", "OpenGL") and rid in windows_rids
+                if allowed and len(angle) < 2:
+                    failures.append(f"package must ship ANGLE for {rid} in tier {tier}, found {angle}")
+                if not allowed and angle:
+                    failures.append(f"package must not ship ANGLE for {rid} in tier {tier}, found {angle}")
+
+        if failures:
+            sys.exit("::error::" + "\n".join(failures))
+        print(f"{path.name} satisfies the {tier} contract.")
+        PY

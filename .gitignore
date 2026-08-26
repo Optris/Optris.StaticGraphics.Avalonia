@@ -1,0 +1,10 @@
+bin/
+obj/
+artifacts/
+*.nupkg
+*.snupkg
+External/NativeStatic/.work/
+External/AvaloniaNative/.work/
+# Built static archives land here, one directory per tier. Hundreds of megabytes of build output
+# that CI uploads as artifacts and packs into the nupkgs - never committed.
+External/NativeStatic/static-*/

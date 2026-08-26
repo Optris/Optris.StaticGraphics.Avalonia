@@ -1,0 +1,78 @@
+name: 🐧 Linux static graphics
+
+# No ANGLE anywhere on this platform: the Linux DirectPInvoke list never references
+# av_libglesv2, so an ANGLE archive here would be ~23 MB of payload nothing can link.
+
+on:
+  workflow_call:
+    inputs:
+      skiasharp_version:
+        required: true
+        type: string
+      tiers:
+        description: JSON array of tiers to build
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      skiasharp_version:
+        required: true
+        default: "3.119.4"
+        type: string
+      tiers:
+        required: true
+        default: '["Vulkan","OpenGL","Software"]'
+        type: string
+
+jobs:
+  build:
+    name: 🎨 Skia ${{ matrix.tier }} ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: ${{ fromJSON(inputs.tiers) }}
+        rid: [linux-x64, linux-arm64]
+        include:
+          - rid: linux-x64
+            target_cpu: x64
+            runner: ubuntu-24.04
+          - rid: linux-arm64
+            target_cpu: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    env:
+      SKIASHARP_VERSION: ${{ inputs.skiasharp_version }}
+      RID: ${{ matrix.rid }}
+      TARGET_CPU: ${{ matrix.target_cpu }}
+      TIER: ${{ matrix.tier }}
+      LLVM_AR: llvm-ar
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 💾 Restore native build cache
+        uses: actions/cache@v4
+        # Tier independent on purpose: all three tiers of a RID share one depot_tools and
+        # SkiaSharp checkout, and the restore-keys let a later tier pick up the first one's sync.
+        with:
+          path: External/NativeStatic/.work
+          key: native-work-linux-${{ matrix.rid }}-${{ inputs.skiasharp_version }}-${{ hashFiles('scripts/build-linux-static-graphics.sh') }}
+          restore-keys: |
+            native-work-linux-${{ matrix.rid }}-${{ inputs.skiasharp_version }}-
+            native-work-linux-${{ matrix.rid }}-
+
+      - name: 🧰 Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld llvm g++ ninja-build pkg-config libfontconfig1-dev libglib2.0-dev libgl1-mesa-dev libpci-dev libx11-dev libxcb1-dev libxext-dev
+
+      - name: 🎨 Build Linux static graphics libraries (${{ matrix.tier }})
+        run: scripts/build-linux-static-graphics.sh skia
+
+      - name: 📤 Upload Linux static archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-static-${{ matrix.tier }}-${{ matrix.rid }}
+          path: External/NativeStatic/static-${{ matrix.tier }}/${{ matrix.rid }}/*
+          if-no-files-found: error

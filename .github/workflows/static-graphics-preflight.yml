@@ -1,0 +1,280 @@
+name: 🔎 Preflight
+
+# The packaging project is the single source of truth for the release version, so every
+# entry point resolves it here instead of re-deriving it from tags or hand-typed inputs.
+
+on:
+  workflow_call:
+    inputs:
+      tiers:
+        description: JSON array of tiers to build. Vulkan ⊃ OpenGL ⊃ Software.
+        required: false
+        default: '["Vulkan","OpenGL","Software"]'
+        type: string
+      skiasharp_version:
+        description: Override the SkiaSharp version pinned by the packaging project
+        required: false
+        default: ""
+        type: string
+      build_rev:
+        description: Override the fork build revision pinned by the packaging project
+        required: false
+        default: ""
+        type: string
+      allow_republish:
+        description: Continue even when the resolved version is already on nuget.org
+        required: false
+        default: false
+        type: boolean
+    outputs:
+      package_version:
+        value: ${{ jobs.validate.outputs.package_version }}
+      skiasharp_version:
+        value: ${{ jobs.validate.outputs.skiasharp_version }}
+      build_rev:
+        value: ${{ jobs.validate.outputs.build_rev }}
+      angle_branch:
+        value: ${{ jobs.validate.outputs.angle_branch }}
+      tiers:
+        value: ${{ jobs.validate.outputs.tiers }}
+  workflow_dispatch:
+    inputs:
+      tiers:
+        description: JSON array of tiers to build
+        required: false
+        default: '["Vulkan","OpenGL","Software"]'
+        type: string
+      skiasharp_version:
+        required: false
+        default: ""
+        type: string
+      build_rev:
+        required: false
+        default: ""
+        type: string
+      allow_republish:
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  validate:
+    name: 🔎 Versions & scripts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    outputs:
+      package_version: ${{ steps.versions.outputs.package_version }}
+      skiasharp_version: ${{ steps.versions.outputs.skiasharp_version }}
+      build_rev: ${{ steps.versions.outputs.build_rev }}
+      angle_branch: ${{ steps.versions.outputs.angle_branch }}
+      tiers: ${{ steps.versions.outputs.tiers }}
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.x"
+
+      - name: 🔢 Resolve versions
+        id: versions
+        shell: bash
+        env:
+          INPUT_TIERS: ${{ inputs.tiers }}
+          INPUT_SKIASHARP_VERSION: ${{ inputs.skiasharp_version }}
+          INPUT_BUILD_REV: ${{ inputs.build_rev }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+          import sys
+
+          def fail(message):
+              sys.exit(f"::error::{message}")
+
+          projects = sorted(pathlib.Path("NuGet/StaticGraphics").glob("*.csproj"))
+          if len(projects) != 1:
+              fail(f"Expected exactly one packaging project under NuGet/StaticGraphics, found: {projects}")
+          project = projects[0]
+
+          # Tier is a real build dimension of the packaging project, so evaluate properties with one
+          # pinned; an unset Tier would leave PackageId and the generated props half-defined.
+          result = subprocess.run(
+              [
+                  "dotnet", "msbuild", str(project), "-nologo", "-p:Tier=Vulkan",
+                  "-getProperty:SkiaSharpVersion",
+                  "-getProperty:BuildRev",
+                  "-getProperty:OptrisStaticGraphicsAngleBranch",
+              ],
+              capture_output=True,
+              text=True,
+          )
+          if result.returncode != 0:
+              fail(f"Could not evaluate {project}:\n{result.stdout}\n{result.stderr}")
+
+          start = result.stdout.find("{")
+          if start < 0:
+              fail(f"dotnet msbuild -getProperty returned no JSON:\n{result.stdout}")
+          properties = json.loads(result.stdout[start:]).get("Properties", {})
+
+          skiasharp_version = os.environ.get("INPUT_SKIASHARP_VERSION") or properties.get("SkiaSharpVersion", "")
+          build_rev = os.environ.get("INPUT_BUILD_REV") or properties.get("BuildRev", "")
+          angle_branch = properties.get("OptrisStaticGraphicsAngleBranch", "")
+
+          if not re.fullmatch(r"\d+\.\d+\.\d+", skiasharp_version):
+              fail(f"SkiaSharpVersion must be three numeric parts, got: {skiasharp_version!r}")
+          if not re.fullmatch(r"\d+", build_rev):
+              fail(f"BuildRev must be numeric, got: {build_rev!r}")
+          if not re.fullmatch(r"\d+", angle_branch):
+              fail(f"OptrisStaticGraphicsAngleBranch must be a chromium branch number, got: {angle_branch!r}")
+
+          package_version = f"{skiasharp_version}.{build_rev}"
+
+          patch = pathlib.Path(f"External/NativeStatic/patches/angle-chromium-{angle_branch}.patch")
+          if not patch.is_file():
+              fail(f"Missing ANGLE patch for chromium/{angle_branch}: {patch}")
+
+          tiers = json.loads(os.environ["INPUT_TIERS"] or '["Vulkan","OpenGL","Software"]')
+          known = ["Vulkan", "OpenGL", "Software"]
+          if not tiers or any(tier not in known for tier in tiers):
+              fail(f"tiers must be a non-empty subset of {known}, got: {tiers}")
+          tiers = [tier for tier in known if tier in tiers]
+
+          # A release tag names the exact package version so that a mistyped tag cannot ship a
+          # build under a version nobody reviewed.
+          if os.environ.get("GITHUB_REF_TYPE") == "tag":
+              expected = f"v{package_version}"
+              actual = os.environ.get("GITHUB_REF_NAME")
+              if actual != expected:
+                  fail(f"Release tag must be {expected} to match the packaging project, got {actual}")
+
+          outputs = {
+              "package_version": package_version,
+              "skiasharp_version": skiasharp_version,
+              "build_rev": build_rev,
+              "angle_branch": angle_branch,
+              "tiers": json.dumps(tiers),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              for key, value in outputs.items():
+                  handle.write(f"{key}={value}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write("| Setting | Value |\n| --- | --- |\n")
+              for key, value in outputs.items():
+                  handle.write(f"| `{key}` | `{value}` |\n")
+          PY
+
+      - name: 🚦 Release guard
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ steps.versions.outputs.package_version }}
+          TIERS: ${{ steps.versions.outputs.tiers }}
+          ALLOW_REPUBLISH: ${{ inputs.allow_republish }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          version = os.environ["PACKAGE_VERSION"]
+          tiers = json.loads(os.environ["TIERS"])
+          allow = os.environ.get("ALLOW_REPUBLISH") == "true"
+          is_tag = os.environ.get("GITHUB_REF_TYPE") == "tag"
+
+          def published(package_id):
+              url = f"https://api.nuget.org/v3-flatcontainer/{package_id.lower()}/index.json"
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      return json.load(response).get("versions", [])
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return []
+                  # A half-answered guard is worse than no guard: never assume "not published".
+                  sys.exit(f"::error::nuget.org returned HTTP {error.code} for {package_id}; cannot tell whether {version} is already public.")
+              except Exception as error:  # noqa: BLE001 - any transport failure is equally undecidable
+                  sys.exit(f"::error::Could not reach nuget.org for {package_id} ({error}); cannot tell whether {version} is already public.")
+
+          clashes = [tier for tier in tiers if version in published(f"Optris.StaticGraphics.Avalonia.{tier}")]
+          if not clashes:
+              print(f"{version} is unpublished for tiers {tiers}.")
+              raise SystemExit(0)
+
+          message = f"{version} is already on nuget.org for: {', '.join(clashes)}. Bump BuildRev."
+          if is_tag and not allow:
+              sys.exit(f"::error::{message}")
+          print(f"::warning::{message} Continuing because this is not a tagged release or republish was allowed.")
+          PY
+
+      - name: 📐 Validate build scripts
+        shell: bash
+        run: |
+          set -euo pipefail
+          bash -n scripts/build-linux-static-graphics.sh
+          bash -n scripts/build-macos-static-graphics.sh
+          bash -n scripts/build-macos-avalonia-native-static.sh
+          bash -n scripts/build-macos-font-preinit.sh
+          pwsh -NoProfile -Command '
+            $failed = $false
+            foreach ($file in Get-ChildItem scripts -Filter *.ps1) {
+              $errors = $null
+              [System.Management.Automation.Language.Parser]::ParseFile($file.FullName, [ref]$null, [ref]$errors) | Out-Null
+              if ($errors.Count) { $failed = $true; Write-Host "::error file=$($file.FullName)::$($errors | Out-String)" }
+            }
+            if ($failed) { exit 1 }'
+
+      - name: 🧬 Validate workflow files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -c "import yaml" 2>/dev/null || pip install --quiet pyyaml
+          python3 - <<'PY'
+          import pathlib
+          import sys
+
+          import yaml
+
+          failures = []
+          for path in sorted(pathlib.Path(".github/workflows").glob("*.yml")):
+              try:
+                  document = yaml.safe_load(path.read_text(encoding="utf-8"))
+              except yaml.YAMLError as error:
+                  failures.append(f"{path}: {error}")
+                  continue
+              # PyYAML resolves the bare `on` key to the boolean True.
+              if not isinstance(document, dict) or not ({"on", True} & document.keys()):
+                  failures.append(f"{path}: no trigger block")
+              if "jobs" not in document:
+                  failures.append(f"{path}: no jobs")
+          if failures:
+              sys.exit("::error::" + "; ".join(failures))
+          print("All workflow files parse.")
+          PY
+
+      - name: 🏗️ Compile smoke project
+        run: dotnet build Smoke/AvaloniaStaticLinkSmoke/AvaloniaStaticLinkSmoke.csproj -c Release -p:PublishAot=false
+
+  upstream:
+    name: 🌐 Upstream refs & ANGLE patch
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs: validate
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🌐 Validate upstream refs and ANGLE patch
+        shell: bash
+        env:
+          SKIASHARP_VERSION: ${{ needs.validate.outputs.skiasharp_version }}
+          ANGLE_BRANCH: ${{ needs.validate.outputs.angle_branch }}
+        run: |
+          set -euo pipefail
+          git ls-remote --exit-code --heads https://github.com/mono/SkiaSharp.git "refs/heads/release/${SKIASHARP_VERSION}"
+          git clone --depth 1 --branch "chromium/${ANGLE_BRANCH}" https://github.com/google/angle.git /tmp/optris-angle
+          git -C /tmp/optris-angle apply --check "$GITHUB_WORKSPACE/External/NativeStatic/patches/angle-chromium-${ANGLE_BRANCH}.patch"

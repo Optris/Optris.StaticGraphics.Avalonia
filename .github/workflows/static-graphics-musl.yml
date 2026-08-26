@@ -1,0 +1,102 @@
+name: 🏔️ musl static graphics
+
+# Same reasoning as the glibc Linux build: skia only, no ANGLE.
+
+on:
+  workflow_call:
+    inputs:
+      skiasharp_version:
+        required: true
+        type: string
+      tiers:
+        description: JSON array of tiers to build
+        required: true
+        type: string
+      dotnet_alpine_image:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      skiasharp_version:
+        required: true
+        default: "3.119.4"
+        type: string
+      tiers:
+        required: true
+        default: '["Vulkan","OpenGL","Software"]'
+        type: string
+      dotnet_alpine_image:
+        required: true
+        default: mcr.microsoft.com/dotnet/sdk:10.0.302-alpine3.23
+        type: string
+
+jobs:
+  build:
+    name: 🎨 Skia ${{ matrix.tier }} ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: ${{ fromJSON(inputs.tiers) }}
+        rid: [linux-musl-x64, linux-musl-arm64]
+        include:
+          - rid: linux-musl-x64
+            target_cpu: x64
+            runner: ubuntu-24.04
+          - rid: linux-musl-arm64
+            target_cpu: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 300
+    env:
+      SKIASHARP_VERSION: ${{ inputs.skiasharp_version }}
+      DOTNET_ALPINE_IMAGE: ${{ inputs.dotnet_alpine_image }}
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 💾 Restore native build cache
+        uses: actions/cache@v4
+        with:
+          path: External/NativeStatic/.work
+          key: native-work-musl-${{ matrix.rid }}-${{ inputs.skiasharp_version }}-${{ hashFiles('scripts/build-linux-static-graphics.sh') }}
+          restore-keys: |
+            native-work-musl-${{ matrix.rid }}-${{ inputs.skiasharp_version }}-
+            native-work-musl-${{ matrix.rid }}-
+
+      - name: 🎨 Build musl static graphics libraries (${{ matrix.tier }})
+        run: |
+          docker run --rm \
+            -v "$PWD:/workspace" \
+            -w /workspace \
+            -e RID="${{ matrix.rid }}" \
+            -e TARGET_CPU="${{ matrix.target_cpu }}" \
+            -e TIER="${{ matrix.tier }}" \
+            -e SKIASHARP_VERSION="$SKIASHARP_VERSION" \
+            -e LLVM_AR=llvm-ar \
+            -e DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0 \
+            -e VPYTHON_BYPASS="manually managed python not supported by chrome operations" \
+            "$DOTNET_ALPINE_IMAGE" \
+            sh -lc '
+              set -e
+              apk add --no-cache bash ca-certificates git python3 py3-httplib2 py3-pysocks py3-six clang compiler-rt lld llvm g++ ninja pkgconf fontconfig-dev glib-dev mesa-dev libx11-dev libxcb-dev libxext-dev pciutils-dev linux-headers perl curl tar xz patch gcompat libc6-compat
+              git config --global --add safe.directory "*"
+              python3 - <<'"'"'PY'"'"'
+          import pathlib
+          import httplib2
+
+          path = pathlib.Path(httplib2.__file__).with_name("socks.py")
+          if not path.exists():
+            path.write_text("from socks import *\n")
+          PY
+              bash scripts/build-linux-static-graphics.sh skia
+            '
+
+      - name: 🔧 Normalize native build cache ownership
+        run: sudo chown -R "$(id -u):$(id -g)" External/NativeStatic
+
+      - name: 📤 Upload musl static archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-static-${{ matrix.tier }}-${{ matrix.rid }}
+          path: External/NativeStatic/static-${{ matrix.tier }}/${{ matrix.rid }}/*
+          if-no-files-found: error

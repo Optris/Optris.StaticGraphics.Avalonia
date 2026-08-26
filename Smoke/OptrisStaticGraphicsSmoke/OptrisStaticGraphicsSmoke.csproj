@@ -1,0 +1,74 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- scripts/create-avalonia-smoke.ps1 writes this file next to the copied project. -->
+  <Import Project="SmokeVersions.props" Condition="Exists('SmokeVersions.props')" />
+
+  <PropertyGroup>
+    <!-- Console subsystem, not WinExe: the verdict goes to stdout and CI has to be able to read it even
+         when the process is started without a console of its own. A console app can still open windows. -->
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AvaloniaUseCompiledBindingsByDefault>true</AvaloniaUseCompiledBindingsByDefault>
+    <PublishAot>true</PublishAot>
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <PublishTrimmed>true</PublishTrimmed>
+    <PublishReadyToRun>false</PublishReadyToRun>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <RootNamespace>Optris.StaticGraphics.Smoke</RootNamespace>
+    <AssemblyName>OptrisStaticGraphicsSmoke</AssemblyName>
+    <AvaloniaVersion Condition="'$(AvaloniaVersion)' == ''">11.3.14</AvaloniaVersion>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(SmokeRequiredBackends)' != ''">
+    <!-- The smoke app opts into the consumer guard so CI proves the guard passes on a matching tier -
+         and, when pointed at a lesser tier on purpose, that it fails the build with OSG0001. -->
+    <OptrisStaticGraphicsRequiredBackends>$(SmokeRequiredBackends)</OptrisStaticGraphicsRequiredBackends>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(SmokeAcknowledgeReducedTier)' != ''">
+    <OptrisStaticGraphicsAcknowledgeReducedTier>$(SmokeAcknowledgeReducedTier)</OptrisStaticGraphicsAcknowledgeReducedTier>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Avalonia" Version="$(AvaloniaVersion)" />
+    <PackageReference Include="Avalonia.Desktop" Version="$(AvaloniaVersion)" />
+    <PackageReference Include="Avalonia.Themes.Fluent" Version="$(AvaloniaVersion)" />
+    <!-- ISkiaSharpApiLeaseFeature lives here; it is how the app gets at the frame Skia actually drew. -->
+    <PackageReference Include="Avalonia.Skia" Version="$(AvaloniaVersion)" />
+    <PackageReference Include="SkiaSharp" Version="$(SmokeSkiaSharpVersion)" Condition="'$(SmokeSkiaSharpVersion)' != ''" />
+    <PackageReference Include="Optris.StaticGraphics.Avalonia.$(SmokeTier)" Version="$(SmokeStaticGraphicsVersion)" Condition="'$(SmokeTier)' != '' and '$(SmokeStaticGraphicsVersion)' != ''" />
+    <PackageReference Include="Optris.StaticGraphics.AvaloniaNative" Version="$(SmokeAvaloniaNativeVersion)" Condition="'$(SmokeAvaloniaNativeVersion)' != ''" />
+  </ItemGroup>
+
+  <!-- Bake the properties the tier package publishes into the binary. An env var can say which tier CI
+       meant to test; only the package itself can say which tier was linked, and the two disagreeing is
+       exactly the mix-up this app exists to catch. A const survives trimming and AOT; attributes and
+       runtime config lookups are not worth betting the check on. -->
+  <Target Name="GenerateLinkedPackageInfo" BeforeTargets="BeforeCompile">
+    <PropertyGroup>
+      <_LinkedPackageInfoFile>$(IntermediateOutputPath)LinkedPackage.g.cs</_LinkedPackageInfoFile>
+      <_LinkedPackageInfoText>// &lt;auto-generated /&gt; Written by the GenerateLinkedPackageInfo target.
+namespace Optris.StaticGraphics.Smoke%3B
+
+internal static class LinkedPackage
+{
+    public const string Tier = "$(OptrisStaticGraphicsTier)"%3B
+    public const string Backends = "$(OptrisStaticGraphicsBackends)"%3B
+    public const string HasVulkan = "$(OptrisStaticGraphicsHasVulkan)"%3B
+    public const string HasAngle = "$(OptrisStaticGraphicsHasAngle)"%3B
+    public const string AngleBranch = "$(OptrisStaticGraphicsAngleBranch)"%3B
+}
+</_LinkedPackageInfoText>
+    </PropertyGroup>
+    <WriteLinesToFile File="$(_LinkedPackageInfoFile)"
+                      Lines="$([MSBuild]::Escape($(_LinkedPackageInfoText)))"
+                      Overwrite="true"
+                      WriteOnlyWhenDifferent="true" />
+    <ItemGroup>
+      <Compile Include="$(_LinkedPackageInfoFile)" />
+      <FileWrites Include="$(_LinkedPackageInfoFile)" />
+    </ItemGroup>
+  </Target>
+</Project>

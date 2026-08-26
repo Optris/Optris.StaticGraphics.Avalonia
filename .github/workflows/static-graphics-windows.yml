@@ -1,0 +1,197 @@
+name: 🪟 Windows static graphics
+
+# ANGLE is tier independent: it is the GL/ANGLE half of the fallback chain and knows nothing
+# about Vulkan. Building it once per RID and handing the archives to the packer is what keeps
+# the tier fan-out near 1.7x instead of 3x — six ninja builds saved per release.
+
+on:
+  workflow_call:
+    inputs:
+      skiasharp_version:
+        required: true
+        type: string
+      angle_branch:
+        required: true
+        type: string
+      tiers:
+        description: JSON array of tiers to build
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      skiasharp_version:
+        required: true
+        default: "3.119.4"
+        type: string
+      angle_branch:
+        required: true
+        default: "7922"
+        type: string
+      tiers:
+        required: true
+        default: '["Vulkan","OpenGL","Software"]'
+        type: string
+
+jobs:
+  angle:
+    name: 🔺 ANGLE ${{ matrix.rid }}
+    # Software is raster only, so nothing in that tier links ANGLE.
+    if: ${{ contains(fromJSON(inputs.tiers), 'Vulkan') || contains(fromJSON(inputs.tiers), 'OpenGL') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: win-x64
+            target_cpu: x64
+            msvc_arch: x64
+          - rid: win-x86
+            target_cpu: x86
+            msvc_arch: x86
+          - rid: win-arm64
+            target_cpu: arm64
+            msvc_arch: amd64_arm64
+    runs-on: windows-2022
+    # Well under the 6 hour job ceiling; a hung gclient sync should fail loudly, not be reaped.
+    timeout-minutes: 300
+    env:
+      SKIASHARP_VERSION: ${{ inputs.skiasharp_version }}
+      ANGLE_BRANCH: ${{ inputs.angle_branch }}
+      RID: ${{ matrix.rid }}
+      TARGET_CPU: ${{ matrix.target_cpu }}
+      DEPOT_TOOLS_WIN_TOOLCHAIN: 0
+      GYP_MSVS_VERSION: 17.0
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 💾 Restore native build cache
+        uses: actions/cache@v4
+        with:
+          path: External/NativeStatic/.work
+          key: native-work-windows-${{ matrix.rid }}-angle-${{ inputs.angle_branch }}-${{ hashFiles('External/NativeStatic/patches/*.patch', 'scripts/build-windows-static-graphics.ps1') }}
+          restore-keys: |
+            native-work-windows-${{ matrix.rid }}-angle-${{ inputs.angle_branch }}-
+            native-work-windows-${{ matrix.rid }}-
+
+      - name: 🧰 Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: 🧰 Configure Chromium Visual Studio environment
+        shell: pwsh
+        run: |
+          "GYP_MSVS_OVERRIDE_PATH=$($env:VSINSTALLDIR.TrimEnd('\', '/'))" >> $env:GITHUB_ENV
+
+      - name: 🧰 Install native build dependencies
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          choco install ninja llvm -y
+
+      - name: 🔺 Validate ANGLE inputs
+        shell: pwsh
+        run: .\scripts\build-windows-static-graphics.ps1 -Target angle-preflight
+
+      - name: 🔺 Build ANGLE
+        shell: pwsh
+        run: .\scripts\build-windows-static-graphics.ps1 -Target angle
+
+      - name: 📤 Collect ANGLE archives
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $staging = "artifacts/angle/${{ matrix.rid }}"
+          New-Item -ItemType Directory -Force -Path $staging | Out-Null
+          # The tier root the script picked is irrelevant here, so collect by name and skip the
+          # build tree, which holds intermediate copies of the same archives.
+          foreach ($name in @("libANGLE_static.lib", "libGLESv2_static.lib", "libc++.lib", "libc++abi.lib")) {
+            $hit = Get-ChildItem -Path "External/NativeStatic" -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch "[\\/]\.work[\\/]" } |
+              Select-Object -First 1
+            if ($hit) {
+              Copy-Item $hit.FullName (Join-Path $staging $name) -Force
+              Write-Host "Collected $name from $($hit.FullName)"
+            } elseif ($name -like "libc++*") {
+              Write-Host "::notice::$name was not produced for ${{ matrix.rid }}; the toolchain supplies it."
+            } else {
+              throw "ANGLE build produced no $name for ${{ matrix.rid }}."
+            }
+          }
+
+      - name: 📤 Upload ANGLE archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: angle-static-${{ matrix.rid }}
+          path: artifacts/angle/${{ matrix.rid }}/*
+          if-no-files-found: error
+
+  skia:
+    name: 🎨 Skia ${{ matrix.tier }} ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: ${{ fromJSON(inputs.tiers) }}
+        rid: [win-x64, win-x86, win-arm64]
+        include:
+          - rid: win-x64
+            target_cpu: x64
+            msvc_arch: x64
+          - rid: win-x86
+            target_cpu: x86
+            msvc_arch: x86
+          - rid: win-arm64
+            target_cpu: arm64
+            msvc_arch: amd64_arm64
+    runs-on: windows-2022
+    timeout-minutes: 300
+    env:
+      SKIASHARP_VERSION: ${{ inputs.skiasharp_version }}
+      ANGLE_BRANCH: ${{ inputs.angle_branch }}
+      RID: ${{ matrix.rid }}
+      TARGET_CPU: ${{ matrix.target_cpu }}
+      TIER: ${{ matrix.tier }}
+      DEPOT_TOOLS_WIN_TOOLCHAIN: 0
+      GYP_MSVS_VERSION: 17.0
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 💾 Restore native build cache
+        uses: actions/cache@v4
+        # The depot_tools and SkiaSharp checkouts under .work are tier independent — only the
+        # gn output tree differs — so the tier stays out of the key and every tier of this RID
+        # shares one entry instead of three.
+        with:
+          path: External/NativeStatic/.work
+          key: native-work-windows-${{ matrix.rid }}-skia-${{ inputs.skiasharp_version }}-${{ hashFiles('scripts/build-windows-static-graphics.ps1') }}
+          restore-keys: |
+            native-work-windows-${{ matrix.rid }}-skia-${{ inputs.skiasharp_version }}-
+            native-work-windows-${{ matrix.rid }}-
+
+      - name: 🧰 Setup MSVC environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: 🧰 Configure Chromium Visual Studio environment
+        shell: pwsh
+        run: |
+          "GYP_MSVS_OVERRIDE_PATH=$($env:VSINSTALLDIR.TrimEnd('\', '/'))" >> $env:GITHUB_ENV
+
+      - name: 🧰 Install native build dependencies
+        shell: pwsh
+        run: |
+          git config --global core.longpaths true
+          choco install ninja llvm -y
+
+      - name: 🎨 Build Skia (${{ matrix.tier }})
+        shell: pwsh
+        run: .\scripts\build-windows-static-graphics.ps1 -Target skia -Tier ${{ matrix.tier }}
+
+      - name: 📤 Upload Windows static archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-static-${{ matrix.tier }}-${{ matrix.rid }}
+          path: External/NativeStatic/static-${{ matrix.tier }}/${{ matrix.rid }}/*
+          if-no-files-found: error

@@ -1,0 +1,157 @@
+name: ♻️ Repack
+
+# The MSBuild props and targets carry the consumer contract (OSG0001, OSG0002, the published
+# OptrisStaticGraphics* properties). Fixing those must not cost a full native rebuild, so this
+# lifts the static payload out of a package we already shipped and repacks it.
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_version:
+        description: Published version whose static libraries to reuse
+        required: true
+        type: string
+      target_version:
+        description: Version to publish as; empty reuses the source version
+        required: false
+        default: ""
+        type: string
+      tiers:
+        description: JSON array of tiers to repack
+        required: false
+        default: '["Vulkan","OpenGL","Software"]'
+        type: string
+      publish_to_nuget:
+        description: Push to nuget.org
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  repack:
+    name: ♻️ Repack ${{ matrix.tier }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: ${{ fromJSON(inputs.tiers) }}
+    env:
+      TIER: ${{ matrix.tier }}
+      SOURCE_VERSION: ${{ inputs.source_version }}
+      TARGET_VERSION: ${{ inputs.target_version || inputs.source_version }}
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.302"
+
+      - name: 🔢 Read the pinned ANGLE branch
+        id: angle
+        shell: bash
+        run: |
+          set -euo pipefail
+          projects=(NuGet/StaticGraphics/*.csproj)
+          branch="$(dotnet msbuild "${projects[0]}" -nologo -p:Tier="$TIER" -getProperty:OptrisStaticGraphicsAngleBranch | tr -d '[:space:]')"
+          [ -n "$branch" ] || { echo "::error::OptrisStaticGraphicsAngleBranch is not set"; exit 1; }
+          echo "branch=$branch" >> "$GITHUB_OUTPUT"
+
+      - name: 📥 Extract static libraries from the published package
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import sys
+          import urllib.request
+          import zipfile
+
+          tier = os.environ["TIER"]
+          version = os.environ["SOURCE_VERSION"]
+          package_id = f"Optris.StaticGraphics.Avalonia.{tier}"
+          url = (
+              f"https://api.nuget.org/v3-flatcontainer/{package_id.lower()}/{version}/"
+              f"{package_id.lower()}.{version}.nupkg"
+          )
+          package = pathlib.Path("artifacts/source.nupkg")
+          package.parent.mkdir(parents=True, exist_ok=True)
+          try:
+              urllib.request.urlretrieve(url, package)
+          except Exception as error:  # noqa: BLE001
+              sys.exit(f"::error::Could not download {package_id} {version}: {error}")
+
+          output = pathlib.Path("External/NativeStatic") / f"static-{tier}"
+          extracted = 0
+          with zipfile.ZipFile(package) as archive:
+              for entry in archive.infolist():
+                  name = entry.filename.replace("\\", "/")
+                  if entry.is_dir() or "/native/" not in name:
+                      continue
+                  # Keep only the <rid>/native/<file> tail, whatever prefix the package used.
+                  parts = name.split("/")
+                  index = parts.index("native")
+                  if index < 1:
+                      continue
+                  destination = output.joinpath(*parts[index - 1:])
+                  destination.parent.mkdir(parents=True, exist_ok=True)
+                  destination.write_bytes(archive.read(entry))
+                  extracted += 1
+          if not extracted:
+              sys.exit(f"::error::{package_id} {version} contained no static payload")
+          print(f"Extracted {extracted} files into {output}")
+          PY
+
+      - name: ✅ Verify tier payload
+        uses: ./.github/actions/verify-tier-payload
+        with:
+          tier: ${{ matrix.tier }}
+
+      - name: 📦 Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          projects=(NuGet/StaticGraphics/*.csproj)
+          [ "${#projects[@]}" -eq 1 ] || { echo "::error::Expected one packaging project, found ${projects[*]}"; exit 1; }
+          skiasharp_version="${TARGET_VERSION%.*}"
+          build_rev="${TARGET_VERSION##*.}"
+          dotnet pack "${projects[0]}" -c Release -o artifacts/nuget \
+            -p:Tier="$TIER" \
+            -p:SkiaSharpVersion="$skiasharp_version" \
+            -p:BuildRev="$build_rev" \
+            -p:Version="$TARGET_VERSION" \
+            -p:PackageVersion="$TARGET_VERSION"
+
+      - name: ✅ Verify package contract
+        uses: ./.github/actions/verify-tier-package
+        with:
+          tier: ${{ matrix.tier }}
+          package: artifacts/nuget/Optris.StaticGraphics.Avalonia.${{ matrix.tier }}.${{ inputs.target_version || inputs.source_version }}.nupkg
+          angle_branch: ${{ steps.angle.outputs.branch }}
+
+      - name: 📤 Upload NuGet package
+        uses: actions/upload-artifact@v7
+        with:
+          name: repacked-nuget-${{ matrix.tier }}
+          path: |
+            artifacts/nuget/*.nupkg
+            artifacts/nuget/*.snupkg
+          if-no-files-found: error
+
+      - name: 🚀 Push to nuget.org
+        if: ${{ inputs.publish_to_nuget == true }}
+        working-directory: artifacts/nuget
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "::error::NUGET_API_KEY is not configured for this repository."
+            exit 1
+          fi
+          dotnet nuget push "*.nupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+          if compgen -G "*.snupkg" > /dev/null; then
+            dotnet nuget push "*.snupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+          fi

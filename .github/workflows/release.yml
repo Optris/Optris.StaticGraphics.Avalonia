@@ -1,0 +1,757 @@
+name: 📦 Release
+
+# One run builds every tier of the fallback chain. Vulkan ⊃ OpenGL ⊃ Software, so a consumer
+# can pick a smaller package without punching a hole in Avalonia's backend fallback.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tiers:
+        description: JSON array of tiers to build
+        required: false
+        default: '["Vulkan","OpenGL","Software"]'
+        type: string
+      skiasharp_version:
+        description: Override the SkiaSharp version pinned by the packaging project
+        required: false
+        default: ""
+        type: string
+      build_rev:
+        description: Override the fork build revision pinned by the packaging project
+        required: false
+        default: ""
+        type: string
+      avalonia_version:
+        description: Avalonia version for the AvaloniaNative package; empty uses latest stable
+        required: false
+        default: ""
+        type: string
+      publish_to_nuget:
+        description: Push to nuget.org after the smoke tests
+        required: false
+        default: false
+        type: boolean
+      publish_to_release:
+        description: Attach packages and smoke apps to a GitHub Release
+        required: false
+        default: true
+        type: boolean
+      allow_republish:
+        description: Continue even when the resolved version is already on nuget.org
+        required: false
+        default: false
+        type: boolean
+  workflow_call:
+    inputs:
+      tiers:
+        required: false
+        default: '["Vulkan","OpenGL","Software"]'
+        type: string
+      skiasharp_version:
+        required: false
+        default: ""
+        type: string
+      build_rev:
+        required: false
+        default: ""
+        type: string
+      avalonia_version:
+        required: false
+        default: ""
+        type: string
+      publish_to_nuget:
+        required: false
+        default: false
+        type: boolean
+      publish_to_release:
+        required: false
+        default: false
+        type: boolean
+      allow_republish:
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  DOTNET_VERSION: "10.0.302"
+  DOTNET_ALPINE_IMAGE: mcr.microsoft.com/dotnet/sdk:10.0.302-alpine3.23
+  AVALONIA_SMOKE_VERSION: "11.3.14"
+
+jobs:
+  preflight:
+    uses: ./.github/workflows/static-graphics-preflight.yml
+    with:
+      tiers: ${{ inputs.tiers || '["Vulkan","OpenGL","Software"]' }}
+      skiasharp_version: ${{ inputs.skiasharp_version || '' }}
+      build_rev: ${{ inputs.build_rev || '' }}
+      allow_republish: ${{ inputs.allow_republish || false }}
+
+  avalonia:
+    name: 🔢 Resolve Avalonia version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      avalonia_version: ${{ steps.resolve.outputs.avalonia_version }}
+      package_version: ${{ steps.resolve.outputs.package_version }}
+    steps:
+      - name: 🔢 Resolve
+        id: resolve
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.avalonia_version }}
+        run: |
+          set -euo pipefail
+          version="${REQUESTED_VERSION:-}"
+          if [ -z "$version" ]; then
+            version="$(curl --fail --silent --show-error --location \
+              https://api.nuget.org/v3-flatcontainer/avalonia/index.json \
+              | jq -r '[.versions[] | select(contains("-") | not)] | last')"
+          fi
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "::error::Could not determine the latest stable Avalonia version."
+            exit 1
+          fi
+          revision="$(curl --silent --location \
+            https://api.nuget.org/v3-flatcontainer/optris.staticgraphics.avalonianative/index.json \
+            | jq -r --arg v "$version" '[.versions[]? | select(startswith($v + ".")) | split(".")[3] | tonumber] | (max // 0) + 1' 2>/dev/null || echo 1)"
+          [ -n "$revision" ] && [ "$revision" != "null" ] || revision=1
+          echo "avalonia_version=$version" >> "$GITHUB_OUTPUT"
+          echo "package_version=$version.$revision" >> "$GITHUB_OUTPUT"
+
+  build-windows:
+    needs: preflight
+    uses: ./.github/workflows/static-graphics-windows.yml
+    with:
+      skiasharp_version: ${{ needs.preflight.outputs.skiasharp_version }}
+      angle_branch: ${{ needs.preflight.outputs.angle_branch }}
+      tiers: ${{ needs.preflight.outputs.tiers }}
+
+  build-linux:
+    needs: preflight
+    uses: ./.github/workflows/static-graphics-linux.yml
+    with:
+      skiasharp_version: ${{ needs.preflight.outputs.skiasharp_version }}
+      tiers: ${{ needs.preflight.outputs.tiers }}
+
+  build-musl:
+    needs: preflight
+    uses: ./.github/workflows/static-graphics-musl.yml
+    with:
+      skiasharp_version: ${{ needs.preflight.outputs.skiasharp_version }}
+      tiers: ${{ needs.preflight.outputs.tiers }}
+      dotnet_alpine_image: mcr.microsoft.com/dotnet/sdk:10.0.302-alpine3.23
+
+  build-macos:
+    needs: preflight
+    uses: ./.github/workflows/static-graphics-macos.yml
+    with:
+      skiasharp_version: ${{ needs.preflight.outputs.skiasharp_version }}
+      tiers: ${{ needs.preflight.outputs.tiers }}
+
+  build-avalonia-native:
+    needs: avalonia
+    uses: ./.github/workflows/avalonia-native-build.yml
+    with:
+      avalonia_version: ${{ needs.avalonia.outputs.avalonia_version }}
+
+  pack:
+    name: 📦 Pack ${{ matrix.tier }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    needs:
+      - preflight
+      - build-windows
+      - build-linux
+      - build-musl
+      - build-macos
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: ${{ fromJSON(needs.preflight.outputs.tiers) }}
+    env:
+      TIER: ${{ matrix.tier }}
+      PACKAGE_VERSION: ${{ needs.preflight.outputs.package_version }}
+      SKIASHARP_VERSION: ${{ needs.preflight.outputs.skiasharp_version }}
+      BUILD_REV: ${{ needs.preflight.outputs.build_rev }}
+      ANGLE_BRANCH: ${{ needs.preflight.outputs.angle_branch }}
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 📥 Download static archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: native-static-${{ matrix.tier }}-*
+          path: External/NativeStatic/static-${{ matrix.tier }}
+
+      - name: 📥 Download shared ANGLE archives
+        # Software links no GL at all, so it never receives the shared ANGLE build.
+        if: ${{ matrix.tier != 'Software' }}
+        uses: actions/download-artifact@v7
+        with:
+          pattern: angle-static-*
+          path: artifacts/angle
+
+      - name: 🧩 Assemble tier payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          root="External/NativeStatic/static-$TIER"
+          for dir in "$root"/native-static-"$TIER"-*; do
+            rid="${dir##*/native-static-$TIER-}"
+            rm -rf "$root/$rid"
+            mv "$dir" "$root/$rid"
+          done
+
+          if [ "$TIER" != "Software" ]; then
+            for rid in win-x64 win-x86 win-arm64; do
+              install -d "$root/$rid/native"
+              cp artifacts/angle/angle-static-"$rid"/* "$root/$rid/native/"
+            done
+          fi
+
+          find "$root" -type f | sort
+
+      - name: ✅ Verify tier payload
+        uses: ./.github/actions/verify-tier-payload
+        with:
+          tier: ${{ matrix.tier }}
+
+      - name: 📦 Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          projects=(NuGet/StaticGraphics/*.csproj)
+          [ "${#projects[@]}" -eq 1 ] || { echo "::error::Expected one packaging project, found ${projects[*]}"; exit 1; }
+          dotnet pack "${projects[0]}" -c Release -o artifacts/nuget \
+            -p:Tier="$TIER" \
+            -p:SkiaSharpVersion="$SKIASHARP_VERSION" \
+            -p:BuildRev="$BUILD_REV" \
+            -p:Version="$PACKAGE_VERSION" \
+            -p:PackageVersion="$PACKAGE_VERSION"
+
+      - name: ✅ Verify package contract
+        uses: ./.github/actions/verify-tier-package
+        with:
+          tier: ${{ matrix.tier }}
+          package: artifacts/nuget/Optris.StaticGraphics.Avalonia.${{ matrix.tier }}.${{ needs.preflight.outputs.package_version }}.nupkg
+          angle_branch: ${{ needs.preflight.outputs.angle_branch }}
+
+      - name: 📤 Upload NuGet package
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuget-${{ matrix.tier }}
+          path: |
+            artifacts/nuget/*.nupkg
+            artifacts/nuget/*.snupkg
+          if-no-files-found: error
+
+  pack-avalonia-native:
+    name: 📦 Pack AvaloniaNative
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs:
+      - avalonia
+      - build-avalonia-native
+    env:
+      PACKAGE_VERSION: ${{ needs.avalonia.outputs.package_version }}
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 📥 Download static AvaloniaNative archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: native-avalonia-*
+          path: artifacts/native
+
+      - name: 🧩 Prepare package inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for rid in osx-x64 osx-arm64; do
+            install -d "External/AvaloniaNative/$rid/native"
+            cp "artifacts/native/native-avalonia-$rid/libAvaloniaNative.a" "External/AvaloniaNative/$rid/native/"
+            cp "artifacts/native/native-avalonia-$rid/macos_font_preinit.o" "External/AvaloniaNative/$rid/native/"
+          done
+
+      - name: 📦 Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          projects=(NuGet/AvaloniaNative/*.csproj)
+          [ "${#projects[@]}" -eq 1 ] || { echo "::error::Expected one AvaloniaNative project, found ${projects[*]}"; exit 1; }
+          dotnet pack "${projects[0]}" -c Release -o artifacts/nuget \
+            -p:Version="$PACKAGE_VERSION" \
+            -p:PackageVersion="$PACKAGE_VERSION"
+
+      - name: ✅ Verify package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="artifacts/nuget/Optris.StaticGraphics.AvaloniaNative.$PACKAGE_VERSION.nupkg"
+          test -f "$package"
+          if unzip -Z1 "$package" | grep -F '\'; then
+            echo "::error::Package contains Windows-only backslash paths."
+            exit 1
+          fi
+          unzip -Z1 "$package" | grep -E "osx-(x64|arm64)/native/libAvaloniaNative\.a"
+
+      - name: 📤 Upload NuGet package
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuget-avalonia-native
+          path: |
+            artifacts/nuget/*.nupkg
+            artifacts/nuget/*.snupkg
+          if-no-files-found: error
+
+  verify-consumer-guard:
+    name: 🛡️ Consumer guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs:
+      - preflight
+      - pack
+    env:
+      PACKAGE_VERSION: ${{ needs.preflight.outputs.package_version }}
+      TIERS: ${{ needs.preflight.outputs.tiers }}
+    steps:
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 📥 Download NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: nuget-*
+          path: artifacts/nuget
+          merge-multiple: true
+
+      - name: 🛡️ Assert OSG0001 fires on a missing backend
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          version = os.environ["PACKAGE_VERSION"]
+          tiers = json.loads(os.environ["TIERS"])
+          backends = {"Vulkan": ["Vulkan", "OpenGL", "Software"], "OpenGL": ["OpenGL", "Software"], "Software": ["Software"]}
+          feed = pathlib.Path("artifacts/nuget").resolve()
+          failures = []
+
+          def build(tier, required, acknowledge):
+              directory = pathlib.Path(f"probe/{tier}-{'-'.join(required) or 'none'}")
+              directory.mkdir(parents=True, exist_ok=True)
+              (directory / "NuGet.config").write_text(
+                  '<?xml version="1.0" encoding="utf-8"?>\n'
+                  "<configuration><packageSources><clear />"
+                  f'<add key="local" value="{feed.as_posix()}" />'
+                  '<add key="nuget" value="https://api.nuget.org/v3/index.json" />'
+                  "</packageSources></configuration>\n",
+                  encoding="utf-8",
+              )
+              (directory / "Probe.csproj").write_text(
+                  "<Project Sdk=\"Microsoft.NET.Sdk\">\n"
+                  "  <PropertyGroup>\n"
+                  "    <TargetFramework>net10.0</TargetFramework>\n"
+                  "    <OutputType>Exe</OutputType>\n"
+                  "    <RuntimeIdentifier>linux-x64</RuntimeIdentifier>\n"
+                  f"    <OptrisStaticGraphicsRequiredBackends>{';'.join(required)}</OptrisStaticGraphicsRequiredBackends>\n"
+                  + (f"    <OptrisStaticGraphicsAcknowledgeReducedTier>true</OptrisStaticGraphicsAcknowledgeReducedTier>\n" if acknowledge else "")
+                  + "  </PropertyGroup>\n"
+                  "  <ItemGroup>\n"
+                  f"    <PackageReference Include=\"Optris.StaticGraphics.Avalonia.{tier}\" Version=\"{version}\" />\n"
+                  "  </ItemGroup>\n"
+                  "</Project>\n",
+                  encoding="utf-8",
+              )
+              (directory / "Program.cs").write_text("System.Console.WriteLine();\n", encoding="utf-8")
+              result = subprocess.run(
+                  ["dotnet", "build", str(directory / "Probe.csproj"), "-c", "Release"],
+                  capture_output=True, text=True,
+              )
+              return result.returncode, result.stdout + result.stderr
+
+          for tier in tiers:
+              code, log = build(tier, backends[tier], acknowledge=True)
+              if code != 0:
+                  failures.append(f"{tier}: a project requiring exactly {backends[tier]} failed to build:\n{log[-4000:]}")
+              missing = [name for name in ("Vulkan", "OpenGL") if name not in backends[tier]]
+              if missing:
+                  code, log = build(tier, [missing[0]], acknowledge=True)
+                  if code == 0:
+                      failures.append(f"{tier}: requiring {missing[0]} built successfully; OSG0001 never fired")
+                  elif "OSG0001" not in log:
+                      failures.append(f"{tier}: requiring {missing[0]} failed without OSG0001:\n{log[-4000:]}")
+                  code, log = build(tier, [], acknowledge=False)
+                  if "OSG0002" not in log:
+                      failures.append(f"{tier}: reduced tier used without acknowledgement did not warn OSG0002")
+
+          if failures:
+              sys.exit("::error::" + "\n\n".join(failures))
+          print("Consumer guard behaves as specified.")
+          PY
+
+  smoke:
+    name: 🔥 Smoke ${{ matrix.tier }} ${{ matrix.rid }}
+    needs:
+      - preflight
+      - pack
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: ${{ fromJSON(needs.preflight.outputs.tiers) }}
+        rid: [win-x64, win-x86, win-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, osx-x64, osx-arm64]
+        include:
+          - rid: win-x64
+            runner: windows-2022
+            msvc_arch: x64
+          - rid: win-x86
+            runner: windows-2022
+            msvc_arch: x86
+          - rid: win-arm64
+            runner: windows-2022
+            msvc_arch: amd64_arm64
+          - rid: linux-x64
+            runner: ubuntu-24.04
+          - rid: linux-arm64
+            runner: ubuntu-24.04-arm
+          - rid: linux-musl-x64
+            runner: ubuntu-24.04
+          - rid: linux-musl-arm64
+            runner: ubuntu-24.04-arm
+          - rid: osx-x64
+            runner: macos-15
+          - rid: osx-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      TIER: ${{ matrix.tier }}
+      RID: ${{ matrix.rid }}
+      PACKAGE_VERSION: ${{ needs.preflight.outputs.package_version }}
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🧰 Setup MSVC environment
+        if: ${{ startsWith(matrix.rid, 'win-') }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: 🧰 Install Linux publish dependencies
+        if: ${{ startsWith(matrix.rid, 'linux-') && !startsWith(matrix.rid, 'linux-musl-') }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang lld xvfb zlib1g-dev libfontconfig1-dev libfreetype6 libgl1 libice6 libsm6 libx11-6 libxcb1 libxcursor1 libxext6 libxfixes3 libxinerama1 libxrandr2 libxrender1 libxi6
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 📥 Download NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: nuget-*
+          path: artifacts/nuget
+          merge-multiple: true
+
+      - name: 🔥 Publish single-file smoke app
+        if: ${{ !startsWith(matrix.rid, 'linux-musl-') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $projectDir = Join-Path $PWD "artifacts/avalonia-smoke-src"
+          pwsh ./scripts/create-avalonia-smoke.ps1 `
+            -ProjectDir $projectDir `
+            -NuGetSource (Resolve-Path "artifacts/nuget") `
+            -Tier "$env:TIER" `
+            -PackageVersion "$env:PACKAGE_VERSION" `
+            -AvaloniaVersion "$env:AVALONIA_SMOKE_VERSION"
+          dotnet publish (Join-Path $projectDir "AvaloniaStaticLinkSmoke.csproj") `
+            -c Release `
+            -r "$env:RID" `
+            --configfile (Join-Path $projectDir "NuGet.config") `
+            /p:PublishAot=true `
+            /p:SelfContained=true `
+            /p:PublishSingleFile=true `
+            /p:StripSymbols=true `
+            /p:PublishDir="$PWD/artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/"
+
+      - name: 🔥 Publish musl smoke app
+        if: ${{ startsWith(matrix.rid, 'linux-musl-') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $projectDir = Join-Path $PWD "artifacts/avalonia-smoke-src"
+          pwsh ./scripts/create-avalonia-smoke.ps1 `
+            -ProjectDir $projectDir `
+            -NuGetSource "/workspace/artifacts/nuget" `
+            -Tier "$env:TIER" `
+            -PackageVersion "$env:PACKAGE_VERSION" `
+            -AvaloniaVersion "$env:AVALONIA_SMOKE_VERSION"
+          docker run --rm `
+            -v "${{ github.workspace }}:/workspace" `
+            -w /workspace `
+            "${{ env.DOTNET_ALPINE_IMAGE }}" `
+            sh -c "apk add --no-cache clang lld build-base zlib-dev fontconfig-dev && dotnet publish /workspace/artifacts/avalonia-smoke-src/AvaloniaStaticLinkSmoke.csproj -c Release -r $env:RID --configfile /workspace/artifacts/avalonia-smoke-src/NuGet.config /p:PublishAot=true /p:SelfContained=true /p:PublishSingleFile=true /p:StripSymbols=true /p:PublishDir=/workspace/artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/"
+
+      - name: ✅ Verify no dynamic graphics libraries remain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $publishDir = "artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}"
+          $blocked = Get-ChildItem -Path $publishDir -Recurse -File | Where-Object {
+            $_.Name -in @("libSkiaSharp.dll", "libHarfBuzzSharp.dll", "av_libglesv2.dll", "libSkiaSharp.so", "libHarfBuzzSharp.so", "libSkiaSharp.dylib", "libHarfBuzzSharp.dylib")
+          }
+          if ($blocked) {
+            $blocked | ForEach-Object { Write-Error "Unexpected dynamic graphics library: $($_.FullName)" }
+            exit 1
+          }
+          Get-ChildItem -Path $publishDir -Recurse -File | ForEach-Object { $_.FullName }
+
+      - name: ✅ Verify Windows executable architecture
+        if: ${{ startsWith(matrix.rid, 'win-') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $app = Join-Path $PWD "artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/AvaloniaStaticLinkSmoke.exe"
+          $expectedMachine = @{
+            "win-x64" = "8664 machine"
+            "win-x86" = "14C machine"
+            "win-arm64" = "AA64 machine"
+          }[$env:RID]
+          $headers = & dumpbin /headers $app | Out-String
+          if ($LASTEXITCODE -ne 0 -or $headers -notmatch [regex]::Escape($expectedMachine)) {
+            throw "Expected $expectedMachine in PE headers for $app.`n$headers"
+          }
+
+      - name: ▶️ Run Windows smoke app
+        if: ${{ matrix.rid == 'win-x64' || matrix.rid == 'win-x86' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $publishDir = Join-Path $PWD "artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}"
+          $app = Join-Path $publishDir "AvaloniaStaticLinkSmoke.exe"
+          $process = Start-Process -FilePath $app -WorkingDirectory $publishDir -PassThru
+          if ($process.WaitForExit(15000)) {
+            if ($process.ExitCode -eq 0) {
+              Write-Host "Smoke app exited normally."
+              exit 0
+            }
+            throw "Smoke app failed with exit code $($process.ExitCode)."
+          }
+          Stop-Process -Id $process.Id -Force
+          Write-Host "Smoke app stayed alive for 15 seconds."
+
+      - name: ▶️ Run Linux smoke app
+        if: ${{ startsWith(matrix.rid, 'linux-') && !startsWith(matrix.rid, 'linux-musl-') }}
+        shell: bash
+        run: |
+          set +e
+          cd "artifacts/smoke-$TIER-$RID"
+          chmod +x ./AvaloniaStaticLinkSmoke
+          timeout 15s xvfb-run -a ./AvaloniaStaticLinkSmoke
+          code=$?
+          if [ "$code" = 124 ] || [ "$code" = 143 ]; then
+            echo "Smoke app stayed alive for 15 seconds."
+            exit 0
+          fi
+          exit "$code"
+
+      - name: ✅ Verify musl ELF dependencies
+        if: ${{ startsWith(matrix.rid, 'linux-musl-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e APP="artifacts/smoke-$TIER-$RID/AvaloniaStaticLinkSmoke" \
+            alpine:3.23 \
+            sh -c 'apk add --no-cache binutils pax-utils && readelf -l "$APP" | grep "Requesting program interpreter: /lib/ld-musl-" && scanelf -n "$APP" && ! scanelf -n "$APP" | grep -E "ld-linux|ld64.so"'
+
+      - name: ▶️ Run musl smoke app
+        if: ${{ startsWith(matrix.rid, 'linux-musl-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w "/workspace/artifacts/smoke-$TIER-$RID" \
+            alpine:3.23 \
+            sh -c 'apk add --no-cache xvfb-run libstdc++ libgcc fontconfig freetype ttf-dejavu libx11 libxcb libxext libxrender libxi libxrandr libxcursor libxfixes libxinerama libice libsm mesa-gl mesa-egl && fc-cache -f && fc-match sans && chmod +x ./AvaloniaStaticLinkSmoke && timeout 15s xvfb-run -a ./AvaloniaStaticLinkSmoke || code=$?; if [ "${code:-0}" = 124 ] || [ "${code:-0}" = 143 ]; then echo "Smoke app stayed alive for 15 seconds."; exit 0; fi; exit "${code:-0}"'
+
+      - name: ▶️ Run macOS smoke app
+        if: ${{ startsWith(matrix.rid, 'osx-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "artifacts/smoke-$TIER-$RID"
+          chmod +x ./AvaloniaStaticLinkSmoke
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+
+          log = pathlib.Path("avalonia-smoke-run.log")
+          proc = subprocess.Popen(
+              ["./AvaloniaStaticLinkSmoke"],
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              text=True,
+          )
+          try:
+              output, _ = proc.communicate(timeout=15)
+          except subprocess.TimeoutExpired:
+              proc.kill()
+              output, _ = proc.communicate()
+              log.write_text(output or "")
+              print(output or "")
+              print("Smoke app stayed alive for 15 seconds.")
+              sys.exit(0)
+
+          log.write_text(output or "")
+          print(output or "")
+          if proc.returncode == 0:
+              print("Smoke app exited normally.")
+              sys.exit(0)
+          print(f"Smoke app failed with exit code {proc.returncode}.", file=sys.stderr)
+          sys.exit(proc.returncode if proc.returncode > 0 else 1)
+          PY
+
+      - name: 📤 Upload smoke app
+        uses: actions/upload-artifact@v7
+        with:
+          name: avalonia-smoke-${{ matrix.tier }}-${{ matrix.rid }}
+          path: artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/**
+          if-no-files-found: error
+
+  publish-nuget:
+    name: 🚀 Publish to nuget.org
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs:
+      - pack
+      - pack-avalonia-native
+      - verify-consumer-guard
+      - smoke
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish_to_nuget == true }}
+    steps:
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 📥 Download NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: nuget-*
+          path: artifacts/nuget
+          merge-multiple: true
+
+      - name: 🚀 Push
+        working-directory: artifacts/nuget
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "::error::NUGET_API_KEY is not configured for this repository."
+            exit 1
+          fi
+          ls -la
+          dotnet nuget push "*.nupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+          if compgen -G "*.snupkg" > /dev/null; then
+            dotnet nuget push "*.snupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+          fi
+
+  release:
+    name: 🏷️ GitHub Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    needs:
+      - preflight
+      - avalonia
+      - pack
+      - pack-avalonia-native
+      - verify-consumer-guard
+      - smoke
+    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish_to_release == true }}
+    permissions:
+      contents: write
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 📥 Download NuGet packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: nuget-*
+          path: release-artifacts/nuget
+          merge-multiple: true
+
+      - name: 📥 Download smoke artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: avalonia-smoke-*
+          path: release-artifacts/smoke
+
+      - name: 🧩 Prepare release files
+        run: |
+          set -euo pipefail
+          mkdir -p release-files
+          find release-artifacts/nuget -type f \( -name '*.nupkg' -o -name '*.snupkg' \) -exec cp {} release-files/ \;
+          for dir in release-artifacts/smoke/avalonia-smoke-*; do
+            [ -d "$dir" ] || continue
+            (cd "$dir" && zip -qr "$GITHUB_WORKSPACE/release-files/$(basename "$dir").zip" .)
+          done
+          ls -la release-files
+
+      - name: 🏷️ Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_VERSION: ${{ needs.preflight.outputs.package_version }}
+          NATIVE_VERSION: ${{ needs.avalonia.outputs.package_version }}
+          TIERS: ${{ needs.preflight.outputs.tiers }}
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            release_tag="${GITHUB_REF_NAME}"
+          else
+            release_tag="v${PACKAGE_VERSION}"
+          fi
+          notes="Tiers: ${TIERS}. Optris.StaticGraphics.Avalonia.<Tier> ${PACKAGE_VERSION}, Optris.StaticGraphics.AvaloniaNative ${NATIVE_VERSION}. Each tier is a strict superset of the next: Vulkan ⊃ OpenGL ⊃ Software."
+          if gh release view "$release_tag" >/dev/null 2>&1; then
+            gh release upload "$release_tag" release-files/* --clobber
+          else
+            gh release create "$release_tag" release-files/* \
+              --target "$GITHUB_SHA" \
+              --title "Optris.StaticGraphics.Avalonia ${PACKAGE_VERSION}" \
+              --notes "$notes"
+          fi

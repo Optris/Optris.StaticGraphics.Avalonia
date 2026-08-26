@@ -1,0 +1,290 @@
+name: 🍏 AvaloniaNative
+
+# libAvaloniaNative.a tracks Avalonia, not SkiaSharp, so it ships on its own cadence instead of
+# waiting for a graphics release. The release workflow packs it too, from the same build.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+    inputs:
+      avalonia_version:
+        description: Avalonia version to build; empty uses the latest stable
+        required: false
+        default: ""
+        type: string
+      force_build:
+        description: Build even when this version is already published
+        required: false
+        default: false
+        type: boolean
+      publish_to_nuget:
+        description: Push to nuget.org after the smoke test
+        required: false
+        default: true
+        type: boolean
+
+concurrency:
+  group: avalonia-native
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: 🔢 Detect unpublished Avalonia version
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      avalonia_version: ${{ steps.version.outputs.avalonia_version }}
+      package_version: ${{ steps.version.outputs.package_version }}
+      should_build: ${{ steps.version.outputs.should_build }}
+    steps:
+      - name: 🔢 Detect
+        id: version
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.avalonia_version }}
+          FORCE_BUILD: ${{ inputs.force_build }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          def versions(package_id):
+              url = f"https://api.nuget.org/v3-flatcontainer/{package_id.lower()}/index.json"
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      return json.load(response).get("versions", [])
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return []
+                  sys.exit(f"::error::nuget.org returned HTTP {error.code} for {package_id}.")
+              except Exception as error:  # noqa: BLE001
+                  sys.exit(f"::error::Could not reach nuget.org for {package_id}: {error}")
+
+          requested = os.environ.get("REQUESTED_VERSION") or ""
+          if requested:
+              avalonia_version = requested
+          else:
+              stable = [version for version in versions("Avalonia") if "-" not in version]
+              if not stable:
+                  sys.exit("::error::nuget.org returned no stable Avalonia versions.")
+              avalonia_version = stable[-1]
+
+          shipped = versions("Optris.StaticGraphics.AvaloniaNative")
+          matching = [version for version in shipped if version.startswith(f"{avalonia_version}.")]
+          revisions = [
+              int(version.split(".")[3])
+              for version in matching
+              if len(version.split(".")) == 4 and version.split(".")[3].isdigit()
+          ]
+          revision = (max(revisions) + 1) if revisions else 1
+          should_build = (not matching) or os.environ.get("FORCE_BUILD") == "true"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"avalonia_version={avalonia_version}\n")
+              handle.write(f"package_version={avalonia_version}.{revision}\n")
+              handle.write(f"should_build={str(should_build).lower()}\n")
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(f"Avalonia **{avalonia_version}**, package **{avalonia_version}.{revision}**, build: **{should_build}**\n")
+          PY
+
+  build:
+    needs: detect
+    if: ${{ needs.detect.outputs.should_build == 'true' }}
+    uses: ./.github/workflows/avalonia-native-build.yml
+    with:
+      avalonia_version: ${{ needs.detect.outputs.avalonia_version }}
+
+  pack:
+    name: 📦 Pack
+    needs:
+      - detect
+      - build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      PACKAGE_VERSION: ${{ needs.detect.outputs.package_version }}
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.302"
+
+      - name: 📥 Download static AvaloniaNative archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: native-avalonia-*
+          path: artifacts/native
+
+      - name: 🧩 Prepare package inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          for rid in osx-x64 osx-arm64; do
+            install -d "External/AvaloniaNative/$rid/native"
+            cp "artifacts/native/native-avalonia-$rid/libAvaloniaNative.a" "External/AvaloniaNative/$rid/native/"
+            cp "artifacts/native/native-avalonia-$rid/macos_font_preinit.o" "External/AvaloniaNative/$rid/native/"
+          done
+
+      - name: 📦 Pack
+        shell: bash
+        run: |
+          set -euo pipefail
+          projects=(NuGet/AvaloniaNative/*.csproj)
+          [ "${#projects[@]}" -eq 1 ] || { echo "::error::Expected one AvaloniaNative project, found ${projects[*]}"; exit 1; }
+          dotnet pack "${projects[0]}" -c Release -o artifacts/nuget \
+            -p:Version="$PACKAGE_VERSION" \
+            -p:PackageVersion="$PACKAGE_VERSION"
+
+      - name: ✅ Verify package
+        shell: bash
+        run: |
+          set -euo pipefail
+          package="artifacts/nuget/Optris.StaticGraphics.AvaloniaNative.$PACKAGE_VERSION.nupkg"
+          test -f "$package"
+          if unzip -Z1 "$package" | grep -F '\'; then
+            echo "::error::Package contains Windows-only backslash paths."
+            exit 1
+          fi
+          unzip -Z1 "$package" | grep -E "osx-(x64|arm64)/native/libAvaloniaNative\.a"
+
+      - name: 📤 Upload NuGet package
+        uses: actions/upload-artifact@v7
+        with:
+          name: nuget-avalonia-native
+          path: |
+            artifacts/nuget/*.nupkg
+            artifacts/nuget/*.snupkg
+          if-no-files-found: error
+
+  smoke:
+    name: 🔥 Smoke ${{ matrix.rid }}
+    needs:
+      - detect
+      - pack
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: osx-x64
+            runner: macos-14
+          - rid: osx-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.302"
+
+      - name: 📥 Download NuGet package
+        uses: actions/download-artifact@v7
+        with:
+          name: nuget-avalonia-native
+          path: artifacts/nuget
+
+      - name: 🔥 Publish Avalonia smoke app
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $projectDir = Join-Path $PWD "artifacts/avalonia-native-smoke-src"
+          pwsh ./scripts/create-avalonia-smoke.ps1 `
+            -ProjectDir $projectDir `
+            -NuGetSource (Resolve-Path "artifacts/nuget") `
+            -AvaloniaVersion "${{ needs.detect.outputs.avalonia_version }}" `
+            -AvaloniaNativeVersion "${{ needs.detect.outputs.package_version }}"
+          dotnet publish (Join-Path $projectDir "AvaloniaStaticLinkSmoke.csproj") `
+            -c Release `
+            -r "${{ matrix.rid }}" `
+            --configfile (Join-Path $projectDir "NuGet.config") `
+            /p:PublishDir="$PWD/artifacts/smoke-${{ matrix.rid }}/"
+
+      - name: ✅ Verify AvaloniaNative is statically linked
+        shell: bash
+        run: |
+          set -euo pipefail
+          test ! -f "artifacts/smoke-${{ matrix.rid }}/libAvaloniaNative.dylib"
+          test -x "artifacts/smoke-${{ matrix.rid }}/AvaloniaStaticLinkSmoke"
+
+      - name: ▶️ Run Avalonia smoke app
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "artifacts/smoke-${{ matrix.rid }}"
+          python3 - <<'PY'
+          import subprocess
+          import sys
+
+          proc = subprocess.Popen(
+              ["./AvaloniaStaticLinkSmoke"],
+              stdout=subprocess.PIPE,
+              stderr=subprocess.STDOUT,
+              text=True,
+          )
+          try:
+              output, _ = proc.communicate(timeout=15)
+          except subprocess.TimeoutExpired:
+              proc.kill()
+              output, _ = proc.communicate()
+              print(output or "")
+              print("Smoke app stayed alive for 15 seconds.")
+              sys.exit(0)
+
+          print(output or "")
+          if proc.returncode == 0:
+              sys.exit(0)
+          sys.exit(proc.returncode if proc.returncode > 0 else 1)
+          PY
+
+  publish:
+    name: 🚀 Publish to nuget.org
+    needs:
+      - detect
+      - smoke
+    if: ${{ github.event_name == 'schedule' || inputs.publish_to_nuget == true }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: "10.0.302"
+
+      - name: 📥 Download NuGet package
+        uses: actions/download-artifact@v7
+        with:
+          name: nuget-avalonia-native
+          path: artifacts/nuget
+
+      - name: 🚀 Push
+        working-directory: artifacts/nuget
+        env:
+          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${NUGET_API_KEY:-}" ]; then
+            echo "::error::NUGET_API_KEY is not configured for this repository."
+            exit 1
+          fi
+          dotnet nuget push "*.nupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+          if compgen -G "*.snupkg" > /dev/null; then
+            dotnet nuget push "*.snupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+          fi

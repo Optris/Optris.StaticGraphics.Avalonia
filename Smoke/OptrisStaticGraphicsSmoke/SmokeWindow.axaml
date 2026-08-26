@@ -1,0 +1,13 @@
+<Window xmlns="https://github.com/avaloniaui"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        x:Class="Optris.StaticGraphics.Smoke.SmokeWindow"
+        Width="560"
+        Height="400"
+        CanResize="False"
+        WindowStartupLocation="CenterScreen"
+        Title="Optris static graphics smoke"
+        Background="#FF3C0033">
+  <!-- The window is larger than the scene, and its background is a colour the scene never uses, so a
+       scene that fails to draw reads back as this magenta rather than as something plausible. -->
+  <Panel x:Name="Host" />
+</Window>

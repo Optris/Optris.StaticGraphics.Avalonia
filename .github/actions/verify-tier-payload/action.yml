@@ -1,0 +1,144 @@
+name: Verify tier payload
+description: Assert that a tier's static payload contains exactly the backends that tier promises.
+
+inputs:
+  tier:
+    description: Vulkan, OpenGL or Software
+    required: true
+  root:
+    description: Directory holding one subdirectory per RID
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: ✅ Verify tier payload
+      shell: bash
+      env:
+        TIER: ${{ inputs.tier }}
+        ROOT: ${{ inputs.root }}
+      run: |
+        python3 - <<'PY'
+        import os
+        import pathlib
+        import sys
+
+        tier = os.environ["TIER"]
+        root = pathlib.Path(os.environ.get("ROOT") or f"External/NativeStatic/static-{tier}")
+        if tier not in ("Vulkan", "OpenGL", "Software"):
+            sys.exit(f"::error::Unknown tier {tier!r}")
+        if not root.is_dir():
+            sys.exit(f"::error::{root} does not exist")
+
+        windows_rids = ["win-x64", "win-x86", "win-arm64"]
+        unix_rids = [
+            "linux-x64", "linux-arm64",
+            "linux-musl-x64", "linux-musl-arm64",
+            "osx-x64", "osx-arm64",
+        ]
+        angle_stems = ("libANGLE_static.", "libGLESv2_static.")
+        failures = []
+
+        def require(path):
+            if not path.is_file():
+                failures.append(f"missing {path}")
+                return None
+            return path
+
+        skia_archives = {}
+        for rid in windows_rids:
+            native = root / rid / "native"
+            skia_archives[rid] = require(native / "skia.lib")
+            require(native / "SkiaSharp.lib")
+            require(native / "libHarfBuzzSharp.lib")
+            if rid == "win-x86":
+                require(native / "skia_x86_stdcall_thunks.lib")
+        for rid in unix_rids:
+            native = root / rid / "native"
+            skia_archives[rid] = require(native / "libskia.a")
+            require(native / "libSkiaSharp.a")
+            require(native / "libHarfBuzzSharp.a")
+
+        # ANGLE belongs in exactly one place: Windows RIDs of the Vulkan and OpenGL tiers.
+        # Everywhere else it is dead weight that nothing can link.
+        angle_expected = tier in ("Vulkan", "OpenGL")
+        for rid in windows_rids + unix_rids:
+            present = sorted(
+                path.relative_to(root).as_posix()
+                for path in (root / rid).rglob("*")
+                if path.is_file() and path.name.startswith(angle_stems)
+            )
+            allowed = angle_expected and rid in windows_rids
+            if allowed and len(present) < 2:
+                failures.append(f"{rid}: tier {tier} must ship ANGLE, found {present or 'nothing'}")
+            if not allowed and present:
+                failures.append(f"{rid}: tier {tier} must not ship ANGLE, found {present}")
+
+        def scan(path, probes):
+            """Archive symbol tables store names as plain text in COFF .lib and ELF .a alike."""
+            found = set()
+            window = max(len(probe) for probe in probes)
+            tail = b""
+            with path.open("rb") as handle:
+                while True:
+                    chunk = handle.read(8 << 20)
+                    if not chunk:
+                        break
+                    block = tail + chunk
+                    for probe in probes:
+                        if probe.encode() in block:
+                            found.add(probe)
+                    tail = block[-window:]
+            return found
+
+        sanity = ["SkSurface", "SkCanvas", "SkImage"]
+        vulkan_gpu = ["GrVkGpu"]
+        vulkan_context = ["GrVkBackendContext", "VulkanBackendContext"]
+        vulkan_vma = [
+            "AMDMemoryAllocator", "VulkanMemoryAllocator",
+            "GrVkMemoryAllocator", "VmaAllocator", "vmaCreateAllocator",
+        ]
+        gl = ["GrGLInterface", "GrGLGpu"]
+        probes = sanity + vulkan_gpu + vulkan_context + vulkan_vma + gl
+
+        for rid, archive in sorted(skia_archives.items()):
+            if archive is None:
+                continue
+            found = scan(archive, probes)
+            if not found & set(sanity):
+                # A backend verdict we cannot read is worse than no verdict at all.
+                failures.append(
+                    f"{rid}: symbol scan of {archive} matched none of {sanity}, so the archive "
+                    "cannot be read and no backend claim about it can be verified"
+                )
+                continue
+            print(f"{rid}: {sorted(found)}")
+            if tier == "Vulkan":
+                if not found & set(vulkan_gpu):
+                    failures.append(
+                        f"{rid}: Vulkan tier but skia contains no {vulkan_gpu}. SkiaSharp stubs the "
+                        "absent backend rather than dropping it, so every Vulkan context would come "
+                        "back null and the window would render blank with no error"
+                    )
+                if not found & set(vulkan_context):
+                    failures.append(f"{rid}: Vulkan tier but skia contains none of {vulkan_context}")
+                if not found & set(vulkan_vma):
+                    failures.append(
+                        f"{rid}: Vulkan tier but skia contains no memory allocator ({vulkan_vma}). "
+                        "Without VMA the failure looks exactly like no Vulkan at all"
+                    )
+            else:
+                leaked = found & set(vulkan_gpu + vulkan_vma)
+                if leaked:
+                    failures.append(f"{rid}: tier {tier} must not contain Vulkan symbols, found {sorted(leaked)}")
+            if tier in ("Vulkan", "OpenGL"):
+                if not found & set(gl):
+                    failures.append(f"{rid}: tier {tier} must keep the GL backend, found none of {gl}")
+            elif "GrGLGpu" in found:
+                failures.append(f"{rid}: Software tier must not contain the GL backend (GrGLGpu)")
+
+        if failures:
+            sys.exit("::error::" + "\n".join(failures))
+        print(f"Tier {tier} payload verified.")
+        PY

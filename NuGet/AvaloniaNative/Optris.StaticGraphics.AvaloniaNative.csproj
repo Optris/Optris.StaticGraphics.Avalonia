@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+    <!--
+        libAvaloniaNative.a is tier-independent: it carries no Skia backend, so it is packed once
+        and used by every graphics tier. Its version tracks Avalonia, not SkiaSharp.
+    -->
+    <PropertyGroup>
+        <TargetFramework>net8.0</TargetFramework>
+        <IsPackable>true</IsPackable>
+        <NoBuild>true</NoBuild>
+        <IncludeBuildOutput>false</IncludeBuildOutput>
+        <SuppressDependenciesWhenPacking>false</SuppressDependenciesWhenPacking>
+        <PackageId>Optris.StaticGraphics.AvaloniaNative</PackageId>
+        <!--
+            The release version is the Avalonia version this archive was built from plus a build
+            revision, e.g. 11.3.14.1; the workflow that builds the archive passes it. The 0.0.0
+            placeholder exists so a local pack cannot silently claim to match some Avalonia
+            release it was not built against.
+        -->
+        <Version Condition="'$(Version)' == ''">0.0.0</Version>
+        <Authors>Optris GmbH, original by greepar</Authors>
+        <Company>Optris GmbH</Company>
+        <Description>Static AvaloniaNative library for macOS Avalonia NativeAOT publishing. Must match the Avalonia version of the consuming app.</Description>
+        <PackageTags>Avalonia;AvaloniaNative;NativeAOT;macOS;Static</PackageTags>
+        <PackageLicenseExpression>MIT</PackageLicenseExpression>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <RepositoryType>git</RepositoryType>
+        <RepositoryUrl>https://github.com/Optris/Optris.StaticGraphics.Avalonia</RepositoryUrl>
+        <PackageProjectUrl>https://github.com/Optris/Optris.StaticGraphics.Avalonia</PackageProjectUrl>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="README.md" Pack="true" PackagePath="README.md" />
+        <None Include="lib/net8.0/_._" Pack="true" PackagePath="lib/net8.0/_._" />
+        <None Include="buildTransitive/Optris.StaticGraphics.AvaloniaNative.props" Pack="true" PackagePath="buildTransitive/$(PackageId).props" />
+        <None Include="buildTransitive/Optris.StaticGraphics.AvaloniaNative.targets" Pack="true" PackagePath="buildTransitive/$(PackageId).targets" />
+        <None Include="buildTransitive/Optris.StaticGraphics.AvaloniaNative.MacOSFontWarmup.cs" Pack="true" PackagePath="buildTransitive/Optris.StaticGraphics.AvaloniaNative.MacOSFontWarmup.cs" />
+        <None Include="../../External/AvaloniaNative/osx-x64/native/libAvaloniaNative.a" Pack="true" PackagePath="static/osx-x64/native/libAvaloniaNative.a" />
+        <None Include="../../External/AvaloniaNative/osx-x64/native/macos_font_preinit.o" Pack="true" PackagePath="static/osx-x64/native/macos_font_preinit.o" />
+        <None Include="../../External/AvaloniaNative/osx-arm64/native/libAvaloniaNative.a" Pack="true" PackagePath="static/osx-arm64/native/libAvaloniaNative.a" />
+        <None Include="../../External/AvaloniaNative/osx-arm64/native/macos_font_preinit.o" Pack="true" PackagePath="static/osx-arm64/native/macos_font_preinit.o" />
+    </ItemGroup>
+</Project>

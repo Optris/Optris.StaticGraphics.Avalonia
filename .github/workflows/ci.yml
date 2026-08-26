@@ -1,0 +1,19 @@
+name: 🧪 CI
+
+# Everything here is static: no Skia, no ANGLE, no depot_tools. The point is that a typo in a
+# build script or a version that no longer resolves upstream fails in minutes rather than after
+# a multi-hour native build.
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  preflight:
+    uses: ./.github/workflows/static-graphics-preflight.yml

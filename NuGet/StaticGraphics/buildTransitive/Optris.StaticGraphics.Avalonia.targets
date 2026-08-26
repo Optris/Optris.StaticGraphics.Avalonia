@@ -1,0 +1,250 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <_OptrisStaticGraphicsRid Condition="'$(RuntimeIdentifier)' == 'win-x64'">win-x64</_OptrisStaticGraphicsRid>
+        <_OptrisStaticGraphicsRid Condition="'$(RuntimeIdentifier)' == 'win-x86'">win-x86</_OptrisStaticGraphicsRid>
+        <_OptrisStaticGraphicsRid Condition="'$(RuntimeIdentifier)' == 'win-arm64'">win-arm64</_OptrisStaticGraphicsRid>
+        <_OptrisStaticGraphicsRid Condition="'$(RuntimeIdentifier)' == 'linux-x64'">linux-x64</_OptrisStaticGraphicsRid>
+        <_OptrisStaticGraphicsRid Condition="'$(RuntimeIdentifier)' == 'linux-arm64'">linux-arm64</_OptrisStaticGraphicsRid>
+        <_OptrisStaticGraphicsRid Condition="'$(RuntimeIdentifier)' == 'linux-musl-x64'">linux-musl-x64</_OptrisStaticGraphicsRid>
+        <_OptrisStaticGraphicsRid Condition="'$(RuntimeIdentifier)' == 'linux-musl-arm64'">linux-musl-arm64</_OptrisStaticGraphicsRid>
+        <_OptrisStaticGraphicsRid Condition="'$(RuntimeIdentifier)' == 'osx-x64'">osx-x64</_OptrisStaticGraphicsRid>
+        <_OptrisStaticGraphicsRid Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">osx-arm64</_OptrisStaticGraphicsRid>
+        <_OptrisStaticGraphicsNativeRoot Condition="'$(_OptrisStaticGraphicsRid)' != ''">$(OptrisStaticGraphicsRoot)$(_OptrisStaticGraphicsRid)/native</_OptrisStaticGraphicsNativeRoot>
+
+        <_OptrisStaticGraphicsWindows Condition="'$(_OptrisStaticGraphicsRid)' != '' and $(_OptrisStaticGraphicsRid.StartsWith('win-'))">true</_OptrisStaticGraphicsWindows>
+        <_OptrisStaticGraphicsLinux Condition="'$(_OptrisStaticGraphicsRid)' != '' and $(_OptrisStaticGraphicsRid.StartsWith('linux-'))">true</_OptrisStaticGraphicsLinux>
+        <_OptrisStaticGraphicsApple Condition="'$(_OptrisStaticGraphicsRid)' != '' and $(_OptrisStaticGraphicsRid.StartsWith('osx-'))">true</_OptrisStaticGraphicsApple>
+        <!-- Nothing here applies to a dynamically linked build: the payload is link input only. -->
+        <_OptrisStaticGraphicsLink Condition="'$(PublishAot)' == 'true' and '$(_OptrisStaticGraphicsNativeRoot)' != ''">true</_OptrisStaticGraphicsLink>
+
+        <LinkerFlavor Condition="'$(LinkerFlavor)' == '' and '$(_OptrisStaticGraphicsLinux)' == 'true'">lld</LinkerFlavor>
+    </PropertyGroup>
+
+    <!--
+        Skia's own Windows host libraries: every tier needs them, including Software.
+        Upstream added the whole Windows block twice, once here and once again in a
+        BeforeTargets="LinkNative" target. NativeLibrary and LinkerArg are read by LinkNative long
+        after evaluation, so once is enough.
+    -->
+    <ItemGroup Condition="'$(_OptrisStaticGraphicsLink)' == 'true' and '$(_OptrisStaticGraphicsWindows)' == 'true'">
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.lib" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.lib')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/skia_x86_stdcall_thunks.lib" Condition="'$(RuntimeIdentifier)' == 'win-x86' and Exists('$(_OptrisStaticGraphicsNativeRoot)/skia_x86_stdcall_thunks.lib')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/skia.lib" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/skia.lib')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/SkiaSharp.lib" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/SkiaSharp.lib')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libc++.lib" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libc++.lib')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libc++abi.lib" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libc++abi.lib')" />
+        <LinkerArg Include="Gdi32.lib;User32.lib" />
+        <LinkerArg Include="synchronization.lib" />
+        <LinkerArg Include="fontsub.lib;Ole32.lib;USP10.lib" />
+    </ItemGroup>
+
+    <!--
+        ANGLE and the Direct3D import libraries it needs for its D3D9/D3D11/D3D12 renderers and
+        its shader compiler. Skia's Direct3D backend is never compiled in, so tier Software must
+        not drag d3d9/dxgi/dxguid/d3d12/d3dcompiler into the link. Gated on the tier rather than
+        on Exists() alone so a stale payload directory cannot quietly re-add ANGLE.
+    -->
+    <ItemGroup Condition="'$(_OptrisStaticGraphicsLink)' == 'true' and '$(_OptrisStaticGraphicsWindows)' == 'true' and '$(OptrisStaticGraphicsHasAngle)' == 'true'">
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libANGLE_static.lib" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libANGLE_static.lib')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libGLESv2_static.lib" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libGLESv2_static.lib')" />
+        <LinkerArg Include="d3d9.lib;dxguid.lib" />
+        <LinkerArg Include="dxgi.lib" />
+        <LinkerArg Include="d3d12.lib;d3dcompiler.lib" />
+    </ItemGroup>
+
+    <Target Name="OptrisStaticGraphicsAddWindowsDirectPInvokes"
+            BeforeTargets="WriteIlcRspFileForCompilation"
+            Condition="'$(_OptrisStaticGraphicsLink)' == 'true' and '$(_OptrisStaticGraphicsWindows)' == 'true'">
+        <PropertyGroup>
+            <_OptrisStaticGraphicsDirectPInvokeList>$(NativeIntermediateOutputPath)optris-staticgraphics.directpinvokes.txt</_OptrisStaticGraphicsDirectPInvokeList>
+        </PropertyGroup>
+        <ItemGroup>
+            <_OptrisStaticGraphicsDirectPInvoke Include="libHarfBuzzSharp;libHarfBuzzSharp.dll" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.lib')" />
+            <_OptrisStaticGraphicsDirectPInvoke Include="libSkiaSharp;libSkiaSharp.dll" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/SkiaSharp.lib')" />
+            <!-- Avalonia P/Invokes ANGLE as av_libglesv2; Skia's own GL bindings use libGLESv2. -->
+            <_OptrisStaticGraphicsDirectPInvoke Include="libGLESv2;libGLESv2.dll;av_libglesv2;av_libglesv2.dll"
+                                                Condition="'$(OptrisStaticGraphicsHasAngle)' == 'true' and Exists('$(_OptrisStaticGraphicsNativeRoot)/libGLESv2_static.lib')" />
+        </ItemGroup>
+        <MakeDir Directories="$(NativeIntermediateOutputPath)" />
+        <WriteLinesToFile File="$(_OptrisStaticGraphicsDirectPInvokeList)" Lines="@(_OptrisStaticGraphicsDirectPInvoke)" Overwrite="true" WriteOnlyWhenDifferent="true" />
+        <ItemGroup>
+            <DirectPInvoke Include="@(_OptrisStaticGraphicsDirectPInvoke)" />
+            <DirectPInvokeList Include="$(_OptrisStaticGraphicsDirectPInvokeList)" />
+        </ItemGroup>
+    </Target>
+
+    <!--
+        No ANGLE on Linux: the Linux DirectPInvoke list never mentions av_libglesv2, so an
+        libANGLE_static.a/libGLESv2_static.a here would only be dead weight in the link.
+        Avalonia's Linux EGL and GLX paths use the system libGL/libEGL.
+    -->
+    <ItemGroup Condition="'$(_OptrisStaticGraphicsLink)' == 'true' and '$(_OptrisStaticGraphicsLinux)' == 'true'">
+        <DirectPInvoke Include="libHarfBuzzSharp" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.a')" />
+        <DirectPInvoke Include="libSkiaSharp" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libSkiaSharp.a')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.a" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.a')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libskia.a" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libskia.a')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libSkiaSharp.a" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libSkiaSharp.a')" />
+        <NativeSystemLibrary Include="stdc++" />
+        <NativeSystemLibrary Include="gcc_eh" />
+        <NativeSystemLibrary Include="fontconfig" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(_OptrisStaticGraphicsLink)' == 'true' and '$(_OptrisStaticGraphicsLinux)' == 'true' and '$(LinkerFlavor)' == 'lld'">
+        <LinkerArg Include="-Wl,-z,nostart-stop-gc" />
+        <LinkerArg Include="-Wl,--allow-multiple-definition" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libskia.a')" />
+    </ItemGroup>
+
+    <!--
+        The frameworks are needed by libAvaloniaNative as much as by Skia, so they are not tiered:
+        an unused framework contributes no code to the binary.
+    -->
+    <ItemGroup Condition="'$(_OptrisStaticGraphicsLink)' == 'true' and '$(_OptrisStaticGraphicsApple)' == 'true'">
+        <DirectPInvoke Include="libHarfBuzzSharp" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.a')" />
+        <DirectPInvoke Include="libSkiaSharp" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libSkiaSharp.a')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.a" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.a')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libskia.a" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libskia.a')" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsNativeRoot)/libSkiaSharp.a" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libSkiaSharp.a')" />
+        <NativeSystemLibrary Include="c++" />
+        <LinkerArg Include="-framework AppKit" />
+        <LinkerArg Include="-framework Carbon" />
+        <LinkerArg Include="-framework CoreFoundation" />
+        <LinkerArg Include="-framework CoreGraphics" />
+        <LinkerArg Include="-framework CoreText" />
+        <LinkerArg Include="-framework Foundation" />
+        <LinkerArg Include="-framework IOSurface" />
+        <LinkerArg Include="-framework Metal" />
+        <LinkerArg Include="-framework OpenGL" />
+        <LinkerArg Include="-framework QuartzCore" />
+        <LinkerArg Include="-framework UniformTypeIdentifiers" />
+    </ItemGroup>
+
+    <Target Name="OptrisStaticGraphicsDisableStaticExecutableOnApple"
+            BeforeTargets="LinkNative"
+            Condition="'$(PublishAot)' == 'true' and '$(_OptrisStaticGraphicsApple)' == 'true'">
+        <PropertyGroup>
+            <StaticExecutable>false</StaticExecutable>
+        </PropertyGroup>
+        <ItemGroup>
+            <LinkerArg Remove="-static" />
+            <LinkerArg Remove="-static-pie" />
+        </ItemGroup>
+    </Target>
+
+    <Target Name="OptrisStaticGraphicsValidateMacOSStaticLibraries"
+            BeforeTargets="LinkNative"
+            Condition="'$(_OptrisStaticGraphicsLink)' == 'true' and '$(_OptrisStaticGraphicsApple)' == 'true'">
+        <Error Condition="!Exists('$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.a')" Text="Missing static library: $(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.a" />
+        <Error Condition="!Exists('$(_OptrisStaticGraphicsNativeRoot)/libskia.a')" Text="Missing static library: $(_OptrisStaticGraphicsNativeRoot)/libskia.a" />
+        <Error Condition="!Exists('$(_OptrisStaticGraphicsNativeRoot)/libSkiaSharp.a')" Text="Missing static library: $(_OptrisStaticGraphicsNativeRoot)/libSkiaSharp.a" />
+    </Target>
+
+    <Target Name="OptrisStaticGraphicsAddMacOSDirectPInvokes"
+            BeforeTargets="WriteIlcRspFileForCompilation"
+            Condition="'$(_OptrisStaticGraphicsLink)' == 'true' and '$(_OptrisStaticGraphicsApple)' == 'true'">
+        <ItemGroup>
+            <DirectPInvoke Include="libHarfBuzzSharp;libHarfBuzzSharp.dylib" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libHarfBuzzSharp.a')" />
+            <DirectPInvoke Include="libSkiaSharp;libSkiaSharp.dylib" Condition="Exists('$(_OptrisStaticGraphicsNativeRoot)/libSkiaSharp.a')" />
+        </ItemGroup>
+        <Message Importance="high" Text="$(OptrisStaticGraphicsPackageId) DirectPInvoke: @(DirectPInvoke)" />
+        <Message Importance="high" Text="$(OptrisStaticGraphicsPackageId) NativeLibrary: @(NativeLibrary)" />
+    </Target>
+
+    <!--
+        Build-time guards. They run on Build rather than on publish so a wrong tier is caught in
+        the inner loop, long before an AOT publish spends minutes on the link.
+    -->
+    <Target Name="OptrisStaticGraphicsGuards" BeforeTargets="BeforeBuild">
+        <PropertyGroup>
+            <_OptrisStaticGraphicsMessageImportance>normal</_OptrisStaticGraphicsMessageImportance>
+            <_OptrisStaticGraphicsMessageImportance Condition="'$(PublishAot)' == 'true'">high</_OptrisStaticGraphicsMessageImportance>
+            <!--
+                Tier names are declared case-sensitive, but a typo in casing is a slip rather than
+                a different tier, so the comparison folds case and the message echoes what was
+                actually written. A property function escapes its result, which would turn the
+                ';' between two backends into %3B and hand the item below one entry instead of
+                two, so the fold is undone by Unescape.
+            -->
+            <_OptrisStaticGraphicsRequiredLower Condition="'$(OptrisStaticGraphicsRequiredBackends)' != ''">$([MSBuild]::Unescape($(OptrisStaticGraphicsRequiredBackends.ToLowerInvariant())))</_OptrisStaticGraphicsRequiredLower>
+            <_OptrisStaticGraphicsProvidedLower Condition="'$(OptrisStaticGraphicsBackends)' != ''">$([MSBuild]::Unescape($(OptrisStaticGraphicsBackends.ToLowerInvariant())))</_OptrisStaticGraphicsProvidedLower>
+            <_OptrisStaticGraphicsAngleBranchText>none</_OptrisStaticGraphicsAngleBranchText>
+            <_OptrisStaticGraphicsAngleBranchText Condition="'$(OptrisStaticGraphicsAngleBranch)' != ''">chromium/$(OptrisStaticGraphicsAngleBranch)</_OptrisStaticGraphicsAngleBranchText>
+        </PropertyGroup>
+        <ItemGroup>
+            <_OptrisStaticGraphicsKnownBackend Include="vulkan;opengl;software" />
+            <_OptrisStaticGraphicsRequired Include="$(_OptrisStaticGraphicsRequiredLower)" />
+            <_OptrisStaticGraphicsProvided Include="$(_OptrisStaticGraphicsProvidedLower)" />
+            <_OptrisStaticGraphicsUnknownRequired Include="@(_OptrisStaticGraphicsRequired)" Exclude="@(_OptrisStaticGraphicsKnownBackend)" />
+            <_OptrisStaticGraphicsMissing Include="@(_OptrisStaticGraphicsRequired)" Exclude="@(_OptrisStaticGraphicsProvided)" />
+        </ItemGroup>
+        <PropertyGroup>
+            <_OptrisStaticGraphicsUpgradeTier Condition="'@(_OptrisStaticGraphicsMissing)' != ''">OpenGL</_OptrisStaticGraphicsUpgradeTier>
+            <_OptrisStaticGraphicsUpgradeTier Condition="'@(_OptrisStaticGraphicsMissing->WithMetadataValue('Identity', 'vulkan'))' != ''">Vulkan</_OptrisStaticGraphicsUpgradeTier>
+        </PropertyGroup>
+
+        <Error Condition="'@(OptrisStaticGraphicsTierPackage->Count())' &gt; '1'"
+               Code="OSG0001"
+               Text="More than one Optris.StaticGraphics.Avalonia tier package is referenced: @(OptrisStaticGraphicsTierPackage, ', '). They ship the same DirectPInvoke names and the same static libraries, so the linker would pick one of them and the app would silently ship the other tier's capabilities. Reference exactly one." />
+
+        <Error Condition="'@(_OptrisStaticGraphicsUnknownRequired)' != ''"
+               Code="OSG0001"
+               Text="OptrisStaticGraphicsRequiredBackends ('$(OptrisStaticGraphicsRequiredBackends)') names unknown backends: @(_OptrisStaticGraphicsUnknownRequired, ', '). Valid names are Vulkan, OpenGL and Software (case-insensitive here, case-sensitive in the tier name and package id)." />
+
+        <Error Condition="'@(_OptrisStaticGraphicsMissing)' != ''"
+               Code="OSG0001"
+               Text="$(OptrisStaticGraphicsPackageId) links graphics tier '$(OptrisStaticGraphicsTier)', which provides $(OptrisStaticGraphicsBackends), but OptrisStaticGraphicsRequiredBackends demands '$(OptrisStaticGraphicsRequiredBackends)'. Missing: @(_OptrisStaticGraphicsMissing, ', '). Reference Optris.StaticGraphics.Avalonia.$(_OptrisStaticGraphicsUpgradeTier) instead, or drop the requirement." />
+
+        <Warning Condition="'$(OptrisStaticGraphicsHasVulkan)' != 'true' and '$(OptrisStaticGraphicsAcknowledgeReducedTier)' != 'true'"
+                 Code="OSG0002"
+                 Text="$(OptrisStaticGraphicsPackageId) links the reduced graphics tier '$(OptrisStaticGraphicsTier)' ($(OptrisStaticGraphicsBackends)). Anything this tier leaves out is absent from Skia, so a rendering mode above the tier cannot work at run time. Set OptrisStaticGraphicsAcknowledgeReducedTier=true once that is intended, or reference Optris.StaticGraphics.Avalonia.Vulkan." />
+
+        <!--
+            A RID with no payload links nothing at all and produces an app that still looks for
+            libSkiaSharp at run time, which is the exact silent failure this package exists to
+            remove. Only reported once a RID is actually chosen, so RID-less inner-loop builds
+            stay quiet.
+        -->
+        <Warning Condition="'$(PublishAot)' == 'true' and '$(RuntimeIdentifier)' != '' and ('$(_OptrisStaticGraphicsNativeRoot)' == '' or !Exists('$(_OptrisStaticGraphicsNativeRoot)'))"
+                 Code="OSG0003"
+                 Text="$(OptrisStaticGraphicsPackageId) has no static payload for RuntimeIdentifier '$(RuntimeIdentifier)', so nothing is linked statically and the published app will still need the dynamic SkiaSharp libraries." />
+
+        <Message Importance="$(_OptrisStaticGraphicsMessageImportance)"
+                 Text="$(OptrisStaticGraphicsPackageId) $(OptrisStaticGraphicsPackageVersion): tier '$(OptrisStaticGraphicsTier)', backends $(OptrisStaticGraphicsBackends), Vulkan=$(OptrisStaticGraphicsHasVulkan), ANGLE=$(OptrisStaticGraphicsHasAngle) (branch $(_OptrisStaticGraphicsAngleBranchText))." />
+    </Target>
+
+    <!--
+        The runtime guard is compiled into the consumer, so it is injected only where the Avalonia
+        desktop backends it inspects are actually present: it references Win32PlatformOptions,
+        X11PlatformOptions and AvaloniaNativePlatformOptions, which live in Avalonia.Win32,
+        Avalonia.X11 and Avalonia.Native. Avalonia.Desktop is the package that brings all three.
+        Set OptrisStaticGraphicsInjectRuntimeGuard explicitly when those come in transitively.
+        The reference is detected through an item rather than a property because MSBuild forbids
+        item lists in property conditions during evaluation.
+    -->
+    <ItemGroup>
+        <_OptrisStaticGraphicsAvaloniaDesktopReference Include="@(PackageReference->WithMetadataValue('Identity', 'Avalonia.Desktop'))" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(OptrisStaticGraphicsInjectRuntimeGuard)' == 'true' or ('$(OptrisStaticGraphicsInjectRuntimeGuard)' == '' and '@(_OptrisStaticGraphicsAvaloniaDesktopReference)' != '')">
+        <Compile Include="$(MSBuildThisFileDirectory)Optris.StaticGraphics.Avalonia.TierInfo.cs"
+                 Link="Optris.StaticGraphics.Avalonia.TierInfo.cs"
+                 Condition="Exists('$(MSBuildThisFileDirectory)Optris.StaticGraphics.Avalonia.TierInfo.cs')" />
+        <Compile Include="$(MSBuildThisFileDirectory)Optris.StaticGraphics.Avalonia.RuntimeGuard.cs"
+                 Link="Optris.StaticGraphics.Avalonia.RuntimeGuard.cs"
+                 Condition="Exists('$(MSBuildThisFileDirectory)Optris.StaticGraphics.Avalonia.RuntimeGuard.cs')" />
+    </ItemGroup>
+
+    <Target Name="OptrisStaticGraphicsCleanDynamicAssets"
+            AfterTargets="Publish"
+            Condition="'$(_OptrisStaticGraphicsLink)' == 'true'">
+        <ItemGroup>
+            <_OptrisStaticGraphicsFilesToDelete Include="$(PublishDir)av_libglesv2.dll" />
+            <_OptrisStaticGraphicsFilesToDelete Include="$(PublishDir)libHarfBuzzSharp.dll" />
+            <_OptrisStaticGraphicsFilesToDelete Include="$(PublishDir)libSkiaSharp.dll" />
+            <_OptrisStaticGraphicsFilesToDelete Include="$(PublishDir)libHarfBuzzSharp.so" />
+            <_OptrisStaticGraphicsFilesToDelete Include="$(PublishDir)libSkiaSharp.so" />
+            <_OptrisStaticGraphicsFilesToDelete Include="$(PublishDir)libHarfBuzzSharp.dylib" />
+            <_OptrisStaticGraphicsFilesToDelete Include="$(PublishDir)libSkiaSharp.dylib" />
+        </ItemGroup>
+        <Delete Files="@(_OptrisStaticGraphicsFilesToDelete)" TreatErrorsAsWarnings="true" />
+    </Target>
+</Project>

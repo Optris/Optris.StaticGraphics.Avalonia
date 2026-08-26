@@ -1,0 +1,61 @@
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+    <PropertyGroup>
+        <_OptrisStaticGraphicsAvaloniaNativeRid Condition="'$(RuntimeIdentifier)' == 'osx-x64'">osx-x64</_OptrisStaticGraphicsAvaloniaNativeRid>
+        <_OptrisStaticGraphicsAvaloniaNativeRid Condition="'$(RuntimeIdentifier)' == 'osx-arm64'">osx-arm64</_OptrisStaticGraphicsAvaloniaNativeRid>
+        <_OptrisStaticGraphicsAvaloniaNativePackageRoot Condition="'$(_OptrisStaticGraphicsAvaloniaNativeRid)' != ''">$(OptrisStaticGraphicsAvaloniaNativeRoot)$(_OptrisStaticGraphicsAvaloniaNativeRid)/native</_OptrisStaticGraphicsAvaloniaNativePackageRoot>
+    </PropertyGroup>
+
+    <ItemGroup Condition="'$(PublishAot)' == 'true' and '$(_OptrisStaticGraphicsAvaloniaNativePackageRoot)' != ''">
+        <Compile Include="$(MSBuildThisFileDirectory)Optris.StaticGraphics.AvaloniaNative.MacOSFontWarmup.cs"
+                 Link="Optris.StaticGraphics.AvaloniaNative.MacOSFontWarmup.cs"
+                 Condition="Exists('$(MSBuildThisFileDirectory)Optris.StaticGraphics.AvaloniaNative.MacOSFontWarmup.cs')" />
+        <DirectPInvoke Include="libAvaloniaNative" />
+        <DirectPInvoke Include="libAvaloniaNative.dylib" />
+        <DirectPInvoke Include="AvaloniaNative" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsAvaloniaNativePackageRoot)/macos_font_preinit.o" />
+        <NativeLibrary Include="$(_OptrisStaticGraphicsAvaloniaNativePackageRoot)/libAvaloniaNative.a" />
+        <NativeSystemLibrary Include="c++" />
+        <LinkerArg Include="-framework AppKit" />
+        <LinkerArg Include="-framework Carbon" />
+        <LinkerArg Include="-framework CoreFoundation" />
+        <LinkerArg Include="-framework CoreGraphics" />
+        <LinkerArg Include="-framework Foundation" />
+        <LinkerArg Include="-framework IOSurface" />
+        <LinkerArg Include="-framework Metal" />
+        <LinkerArg Include="-framework OpenGL" />
+        <LinkerArg Include="-framework QuartzCore" />
+        <LinkerArg Include="-framework UniformTypeIdentifiers" />
+    </ItemGroup>
+
+    <Target Name="OptrisStaticGraphicsAvaloniaNativeAddMacOSDirectPInvokes"
+            BeforeTargets="WriteIlcRspFileForCompilation"
+            Condition="'$(PublishAot)' == 'true' and '$(_OptrisStaticGraphicsAvaloniaNativePackageRoot)' != ''">
+        <PropertyGroup>
+            <_OptrisStaticGraphicsAvaloniaNativeDirectPInvokeList>$(NativeIntermediateOutputPath)optris-staticgraphics-avalonianative.directpinvokes.txt</_OptrisStaticGraphicsAvaloniaNativeDirectPInvokeList>
+        </PropertyGroup>
+        <ItemGroup>
+            <_OptrisStaticGraphicsAvaloniaNativeDirectPInvoke Include="libAvaloniaNative;libAvaloniaNative.dylib;AvaloniaNative" />
+        </ItemGroup>
+        <MakeDir Directories="$(NativeIntermediateOutputPath)" />
+        <WriteLinesToFile File="$(_OptrisStaticGraphicsAvaloniaNativeDirectPInvokeList)" Lines="@(_OptrisStaticGraphicsAvaloniaNativeDirectPInvoke)" Overwrite="true" WriteOnlyWhenDifferent="true" />
+        <ItemGroup>
+            <DirectPInvoke Include="@(_OptrisStaticGraphicsAvaloniaNativeDirectPInvoke)" />
+            <DirectPInvokeList Include="$(_OptrisStaticGraphicsAvaloniaNativeDirectPInvokeList)" />
+        </ItemGroup>
+        <Error Condition="!Exists('$(_OptrisStaticGraphicsAvaloniaNativePackageRoot)/libAvaloniaNative.a')" Text="Optris.StaticGraphics.AvaloniaNative could not find $(_OptrisStaticGraphicsAvaloniaNativePackageRoot)/libAvaloniaNative.a. Check the package version and restore cache." />
+        <Error Condition="!Exists('$(_OptrisStaticGraphicsAvaloniaNativePackageRoot)/macos_font_preinit.o')" Text="Optris.StaticGraphics.AvaloniaNative could not find $(_OptrisStaticGraphicsAvaloniaNativePackageRoot)/macos_font_preinit.o. Check the package version and restore cache." />
+        <Message Importance="high" Text="Optris.StaticGraphics.AvaloniaNative Root: $(_OptrisStaticGraphicsAvaloniaNativePackageRoot)" />
+        <Message Importance="high" Text="Optris.StaticGraphics.AvaloniaNative DirectPInvoke: @(DirectPInvoke)" />
+        <Message Importance="high" Text="Optris.StaticGraphics.AvaloniaNative DirectPInvokeList: @(DirectPInvokeList)" />
+        <Message Importance="high" Text="Optris.StaticGraphics.AvaloniaNative NativeLibrary: @(NativeLibrary)" />
+    </Target>
+
+    <Target Name="OptrisStaticGraphicsAvaloniaNativeCleanDynamicAssets"
+            AfterTargets="Publish"
+            Condition="'$(PublishAot)' == 'true' and '$(_OptrisStaticGraphicsAvaloniaNativePackageRoot)' != ''">
+        <ItemGroup>
+            <_OptrisStaticGraphicsAvaloniaNativeFilesToDelete Include="$(PublishDir)libAvaloniaNative.dylib" />
+        </ItemGroup>
+        <Delete Files="@(_OptrisStaticGraphicsAvaloniaNativeFilesToDelete)" TreatErrorsAsWarnings="true" />
+    </Target>
+</Project>

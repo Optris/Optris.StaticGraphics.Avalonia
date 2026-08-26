@@ -1,0 +1,120 @@
+name: 🔭 SkiaSharp watch
+
+# Rebuilding is expensive, so the trigger compares two facts that cannot drift: the newest
+# stable SkiaSharp on nuget.org, and the versions we have actually published. Anything derived
+# from repo state (a marker file, the pinned property, the last tag) can be edited or reverted
+# and would then either miss a release or rebuild forever.
+#
+# nuget.org is the right upstream to watch rather than mono/SkiaSharp releases or tags: the
+# native build syncs the release/<version> branch that exists once the package ships, and a
+# GitHub release that never reached nuget.org is nothing we could build against anyway.
+
+on:
+  schedule:
+    # SkiaSharp ships a handful of times a year, so daily polling costs one ~15 second job and
+    # bounds the delay at 24 hours. Note GitHub disables cron on repos idle for 60 days.
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report what would happen without starting a build
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: skiasharp-watch
+  cancel-in-progress: false
+
+jobs:
+  check:
+    name: 🔭 Check for a new SkiaSharp
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      skiasharp_version: ${{ steps.check.outputs.skiasharp_version }}
+      build_rev: ${{ steps.check.outputs.build_rev }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: 🔭 Compare upstream against what we shipped
+        id: check
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          def versions(package_id):
+              url = f"https://api.nuget.org/v3-flatcontainer/{package_id.lower()}/index.json"
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      return json.load(response).get("versions", [])
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return []
+                  sys.exit(f"::error::nuget.org returned HTTP {error.code} for {package_id}.")
+              except Exception as error:  # noqa: BLE001
+                  sys.exit(f"::error::Could not reach nuget.org for {package_id}: {error}")
+
+          # The flat container lists versions in ascending SemVer order.
+          stable = [version for version in versions("SkiaSharp") if "-" not in version]
+          if not stable:
+              sys.exit("::error::nuget.org returned no stable SkiaSharp versions.")
+          latest = stable[-1]
+
+          shipped = versions("Optris.StaticGraphics.Avalonia.Vulkan")
+          matching = [version for version in shipped if version.startswith(f"{latest}.")]
+          revisions = []
+          for version in matching:
+              parts = version.split(".")
+              if len(parts) == 4 and parts[3].isdigit():
+                  revisions.append(int(parts[3]))
+
+          should_build = not matching
+          build_rev = (max(revisions) + 1) if revisions else 1
+
+          outputs = {
+              "skiasharp_version": latest,
+              "build_rev": str(build_rev),
+              "should_build": str(should_build).lower(),
+          }
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              for key, value in outputs.items():
+                  handle.write(f"{key}={value}\n")
+
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as handle:
+              handle.write(f"Latest stable SkiaSharp: **{latest}**\n\n")
+              if matching:
+                  handle.write(f"Already shipped as: {', '.join(matching)}. Nothing to do.\n")
+              else:
+                  handle.write(
+                      f"Not shipped yet. Starting a validation build for **{latest}.{build_rev}**.\n\n"
+                      "To release it: bump `SkiaSharpVersion` (and review "
+                      "`OptrisStaticGraphicsAngleBranch`, which usually moves with a new Skia) in the "
+                      f"packaging project, set `BuildRev` to `{build_rev}`, then tag `v{latest}.{build_rev}`.\n"
+                  )
+          PY
+
+  build:
+    name: 🧪 Validation build
+    needs: check
+    if: ${{ needs.check.outputs.should_build == 'true' && inputs.dry_run != true }}
+    # Calling the release workflow instead of dispatching it keeps everything in one run and
+    # sidesteps the question of whether GITHUB_TOKEN may start another workflow.
+    # A called workflow can never hold more permission than its caller, so grant what the
+    # release job declares even though this run never reaches it.
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      skiasharp_version: ${{ needs.check.outputs.skiasharp_version }}
+      build_rev: ${{ needs.check.outputs.build_rev }}
+      publish_to_nuget: false
+      publish_to_release: false
+      allow_republish: false
+    secrets: inherit

@@ -1,0 +1,84 @@
+name: 🍎 macOS static graphics
+
+# The macOS packaging ItemGroup never references ANGLE, so this platform builds skia only.
+
+on:
+  workflow_call:
+    inputs:
+      skiasharp_version:
+        required: true
+        type: string
+      tiers:
+        description: JSON array of tiers to build
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      skiasharp_version:
+        required: true
+        default: "3.119.4"
+        type: string
+      tiers:
+        required: true
+        default: '["Vulkan","OpenGL","Software"]'
+        type: string
+
+jobs:
+  build:
+    name: 🎨 Skia ${{ matrix.tier }} ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: ${{ fromJSON(inputs.tiers) }}
+        rid: [osx-x64, osx-arm64]
+        include:
+          - rid: osx-x64
+            target_cpu: x64
+          - rid: osx-arm64
+            target_cpu: arm64
+    runs-on: macos-15
+    timeout-minutes: 300
+    env:
+      SKIASHARP_VERSION: ${{ inputs.skiasharp_version }}
+      RID: ${{ matrix.rid }}
+      TARGET_CPU: ${{ matrix.target_cpu }}
+      TIER: ${{ matrix.tier }}
+      WORK_DIR: ${{ github.workspace }}/External/NativeStatic/.work
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 💾 Restore native build cache
+        uses: actions/cache@v4
+        with:
+          path: External/NativeStatic/.work
+          key: native-work-macos-${{ matrix.rid }}-${{ inputs.skiasharp_version }}-${{ hashFiles('scripts/build-macos-static-graphics.sh') }}
+          restore-keys: |
+            native-work-macos-${{ matrix.rid }}-${{ inputs.skiasharp_version }}-
+            native-work-macos-${{ matrix.rid }}-
+
+      - name: 🧰 Install native build dependencies
+        run: brew install ninja
+
+      - name: 🧰 Install Xcode Metal toolchain
+        run: |
+          set -euo pipefail
+          cat > /tmp/optris-metal-check.metal <<'EOF'
+          #include <metal_stdlib>
+          using namespace metal;
+          kernel void optris_metal_check(device float* values [[buffer(0)]], uint id [[thread_position_in_grid]]) { values[id] = 0; }
+          EOF
+          if ! xcrun metal -c /tmp/optris-metal-check.metal -o /tmp/optris-metal-check.air >/dev/null 2>&1; then
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun metal -c /tmp/optris-metal-check.metal -o /tmp/optris-metal-check.air >/dev/null
+
+      - name: 🎨 Build macOS static graphics libraries (${{ matrix.tier }})
+        run: bash ./scripts/build-macos-static-graphics.sh skia
+
+      - name: 📤 Upload macOS static archives
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-static-${{ matrix.tier }}-${{ matrix.rid }}
+          path: External/NativeStatic/static-${{ matrix.tier }}/${{ matrix.rid }}/*
+          if-no-files-found: error

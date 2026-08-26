@@ -1,0 +1,62 @@
+name: 🍏 AvaloniaNative build
+
+# libAvaloniaNative.a carries no graphics backend, so it is tier independent and both the
+# release workflow and the standalone Avalonia-cadence workflow call this one.
+
+on:
+  workflow_call:
+    inputs:
+      avalonia_version:
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      avalonia_version:
+        required: true
+        type: string
+
+jobs:
+  build:
+    name: 🍏 AvaloniaNative ${{ matrix.rid }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - rid: osx-x64
+            runner: macos-14
+          - rid: osx-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      RID: ${{ matrix.rid }}
+      AVALONIA_VERSION: ${{ inputs.avalonia_version }}
+      WORK_DIR: ${{ github.workspace }}/External/AvaloniaNative/.work
+      OUTPUT_DIR: ${{ github.workspace }}/External/AvaloniaNative/${{ matrix.rid }}/native
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: |
+            8.0.x
+            10.0.x
+
+      - name: 🍏 Build static AvaloniaNative
+        run: bash scripts/build-macos-avalonia-native-static.sh
+
+      - name: 🔤 Build macOS font preinit object
+        run: bash scripts/build-macos-font-preinit.sh
+
+      - name: 📤 Upload static AvaloniaNative
+        uses: actions/upload-artifact@v7
+        with:
+          name: native-avalonia-${{ matrix.rid }}
+          path: |
+            External/AvaloniaNative/${{ matrix.rid }}/native/libAvaloniaNative.a
+            External/AvaloniaNative/${{ matrix.rid }}/native/macos_font_preinit.o
+          if-no-files-found: error

@@ -1,0 +1,26 @@
+<!-- A Grid and not a UserControl: a templated control renders nothing until a theme has been applied
+     to it, and the offscreen pass draws this scene before any window exists to carry the theme. A
+     panel's children are its visual children, so it draws wherever it is put.
+
+     A 4x4 star grid: every fill below sits in one whole cell, so SceneGeometry can name its centre as
+     a fraction of the scene and stay right at any scaling. -->
+<Grid xmlns="https://github.com/avaloniaui"
+      xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+      x:Class="Optris.StaticGraphics.Smoke.SmokeScene"
+      Background="#FF101A33"
+      ColumnDefinitions="*,*,*,*"
+      RowDefinitions="*,*,*,*">
+  <Border Grid.Column="1" Grid.Row="1" Background="#FF00A000" />
+  <Border Grid.Column="2" Grid.Row="2" Background="#FFC00000" />
+  <Border Grid.Column="3" Grid.Row="1" Background="#FF0060FF" />
+  <!-- Deliberately a system font: a static build that cannot reach fontconfig, DirectWrite or
+       CoreText draws the fills and nothing else, and the caption band is where that shows. -->
+  <TextBlock Grid.Row="3"
+             Grid.Column="0"
+             Grid.ColumnSpan="4"
+             Text="Optris static graphics smoke"
+             Foreground="#FFFFFFFF"
+             FontSize="22"
+             HorizontalAlignment="Center"
+             VerticalAlignment="Center" />
+</Grid>
