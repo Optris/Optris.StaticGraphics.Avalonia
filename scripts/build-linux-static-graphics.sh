@@ -239,6 +239,20 @@ assert_tier_symbols() {
   local lines failures=() name
   lines="$(tier_symbol_lines "$library")"
 
+  # A reader that returns nothing is the dangerous case, not an obvious one: every "must be
+  # defined" check fails, which looks like a broken build, while every "must not contain" check
+  # PASSES - so the Software tier would sail through on an empty read and ship unverified. That
+  # is the same silent-pass shape this repository exists to prevent. Caught on musl, where the
+  # Alpine image had no nm at all and every backend was reported missing from an archive that
+  # had just compiled cleanly.
+  if [ -z "$lines" ]; then
+    echo "Symbol reader returned nothing for $library." >&2
+    echo "That is a broken reader, not a verdict: even a Software build contains Skia's own" >&2
+    echo "symbols, so the pattern should always match something. Check which nm was selected" >&2
+    echo "and that it exists in this environment (Alpine needs binutils or llvm)." >&2
+    return 1
+  fi
+
   if tier_claims Vulkan; then
     # GrVkAMDMemoryAllocator/skgpu::VulkanAMDMemoryAllocator is not optional: Skia's Vulkan
     # backend without VMA fails exactly like a stubbed one, silently.
