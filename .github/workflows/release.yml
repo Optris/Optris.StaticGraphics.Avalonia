@@ -351,6 +351,10 @@ jobs:
     needs:
       - preflight
       - pack
+    # Same reason as pack's, and it has to be repeated here: the skip from build-macos propagates
+    # down the whole chain, not just one level, so pack overriding it does not rescue pack's own
+    # dependents. Without this the guard silently does not run on any include_macos=false build.
+    if: ${{ !failure() && !cancelled() }}
     env:
       PACKAGE_VERSION: ${{ needs.preflight.outputs.package_version }}
       TIERS: ${{ needs.preflight.outputs.tiers }}
@@ -441,6 +445,11 @@ jobs:
     needs:
       - preflight
       - pack
+    # As above. This one matters most: smoke is the only step that renders an actual frame, and
+    # this repository exists because a package can pass every structural check and still draw
+    # nothing. A run that skips it and reports success is the precise failure being guarded
+    # against - which is what happened on the first run where everything else went green.
+    if: ${{ !failure() && !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -745,7 +754,16 @@ jobs:
       - pack-avalonia-native
       - verify-consumer-guard
       - smoke
-    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish_to_nuget == true }}
+    # The gate is spelled out rather than left to GitHub's skip propagation, because publishing is
+    # the one irreversible step here and the propagation rules are exactly what went wrong above:
+    # smoke was skipped while the run still reported success. Naming each result makes "nothing
+    # ships that has not rendered a frame" a property of this file rather than of a default.
+    if: >-
+      ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.publish_to_nuget == true)
+          && needs.pack.result == 'success'
+          && needs['pack-avalonia-native'].result == 'success'
+          && needs['verify-consumer-guard'].result == 'success'
+          && needs.smoke.result == 'success' }}
     steps:
       - name: 🟣 Setup .NET
         uses: actions/setup-dotnet@v5
@@ -795,7 +813,13 @@ jobs:
       - pack-avalonia-native
       - verify-consumer-guard
       - smoke
-    if: ${{ startsWith(github.ref, 'refs/tags/v') || inputs.publish_to_release == true }}
+    # Same reasoning as publish-nuget's: an attached release asset is public too.
+    if: >-
+      ${{ (startsWith(github.ref, 'refs/tags/v') || inputs.publish_to_release == true)
+          && needs.pack.result == 'success'
+          && needs['pack-avalonia-native'].result == 'success'
+          && needs['verify-consumer-guard'].result == 'success'
+          && needs.smoke.result == 'success' }}
     permissions:
       contents: write
     steps:
