@@ -591,6 +591,43 @@ jobs:
             throw "Expected $expectedMachine in PE headers for $app.`n$headers"
           }
 
+      # GitHub's Windows runners have no GPU and no Vulkan ICD, so without this the Vulkan tier
+      # could not be smoke-tested at all on the platform we care most about - the build-time symbol
+      # assertion would prove the backend is PRESENT while nothing proved it RENDERS. lavapipe is
+      # Mesa's CPU Vulkan driver; it is enough for the defect under test, because a Skia built
+      # without Vulkan hands back a null GRContext no matter who provides the device.
+      #
+      # Pinned to one release and verified against the SHA-256 GitHub publishes for that asset, so
+      # this cannot silently become a different binary. It is used ONLY here: it never enters a
+      # package, and this job has no id-token permission, so it cannot reach the publishing path.
+      # Linux gets the same driver from apt (mesa-vulkan-drivers) and needs no download.
+      # No arm64 build exists, which is why win-arm64 is excluded from the smoke step below.
+      - name: 🌋 Install lavapipe (software Vulkan)
+        if: ${{ startsWith(matrix.rid, 'win-') && matrix.rid != 'win-arm64' && matrix.tier == 'Vulkan' }}
+        shell: pwsh
+        env:
+          MESA_URL: https://github.com/pal1000/mesa-dist-win/releases/download/26.1.7/mesa3d-26.1.7-release-msvc.7z
+          MESA_SHA256: c6e90c3117233b66f7816df05026a5fb0f88eaf7829bd07a1724b981487ec0bb
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "mesa.7z"
+          Invoke-WebRequest -Uri $env:MESA_URL -OutFile $archive
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $env:MESA_SHA256) {
+            throw "lavapipe archive checksum mismatch. Expected $env:MESA_SHA256, got $actual. Refusing to run an unverified driver."
+          }
+          # x86 ships its own build; the ICD manifest names the dll beside it, so both files move together.
+          $arch = if ($env:RID -eq "win-x86") { "x86" } else { "x64" }
+          $icdName = if ($arch -eq "x86") { "lvp_icd.x86.json" } else { "lvp_icd.x86_64.json" }
+          $dest = Join-Path $env:RUNNER_TEMP "lavapipe"
+          & 7z x $archive "-o$dest" -y "$arch/vulkan_lvp.dll" "$arch/$icdName" | Out-Null
+          $icd = Join-Path $dest "$arch/$icdName"
+          if (-not (Test-Path $icd)) { throw "lavapipe ICD not found at $icd after extraction." }
+          # VK_DRIVER_FILES restricts the loader to exactly this ICD, so a passing Vulkan smoke here
+          # is proof the software driver drew it rather than something else on the machine.
+          "VK_DRIVER_FILES=$icd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "lavapipe ICD: $icd"
+
       # Windows, Linux and macOS all run the same script, so one check covers three platforms. The
       # app's exit code is the whole verdict: there is deliberately no "it was still running, so it
       # must be fine" branch, because a process that stays alive is precisely what the blank window
