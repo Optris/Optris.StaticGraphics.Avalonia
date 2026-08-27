@@ -221,6 +221,11 @@ jobs:
           bash -n scripts/build-macos-font-preinit.sh
           bash -n scripts/run-smoke.sh
 
+          # The GL-stub patch runs inside every Skia build on all three platforms, so a syntax
+          # error in it is a syntax error in every one of them - discovered after the multi-GB
+          # depot_tools/SkiaSharp sync rather than here.
+          python3 -m py_compile scripts/patch-skia-gl-stubs.py
+
           # Git records the executable bit, and a contributor on Windows adding a script will not
           # set it - the file lands as 100644 and the Linux job dies with "Permission denied", exit
           # 126, twenty minutes into a matrix. That is what happened on the first full release run.
@@ -348,3 +353,40 @@ jobs:
           git ls-remote --exit-code --heads https://github.com/mono/SkiaSharp.git "refs/heads/release/${SKIASHARP_VERSION}"
           git clone --depth 1 --branch "chromium/${ANGLE_BRANCH}" https://github.com/google/angle.git /tmp/optris-angle
           git -C /tmp/optris-angle apply --check "$GITHUB_WORKSPACE/External/NativeStatic/patches/angle-chromium-${ANGLE_BRANCH}.patch"
+
+      # The same question the ANGLE `git apply --check` above answers, for the GL-stub patch:
+      # does it still match the upstream it is written against? That patch edits a pinned
+      # third-party checkout, so the failure that matters is a SkiaSharp bump moving the code out
+      # from under it. The script asserts its own anchors and exits non-zero on a miss, so running
+      # it against the real sources IS the check.
+      # Only the two files it touches are fetched, at the exact skia commit this SkiaSharp release
+      # pins, rather than cloning skia - which is gigabytes for two files.
+      - name: 🩹 Validate the Skia GL-stub patch still applies
+        shell: bash
+        env:
+          SKIASHARP_VERSION: ${{ needs.validate.outputs.skiasharp_version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch "release/${SKIASHARP_VERSION}" \
+            https://github.com/mono/SkiaSharp.git /tmp/optris-skiasharp
+          skia_sha="$(git -C /tmp/optris-skiasharp ls-tree HEAD externals/skia | awk '{print $3}')"
+          if [ -z "$skia_sha" ]; then
+            echo "::error::Could not read the externals/skia submodule commit from SkiaSharp release/${SKIASHARP_VERSION}."
+            exit 1
+          fi
+          echo "SkiaSharp release/${SKIASHARP_VERSION} pins mono/skia at ${skia_sha}"
+
+          mkdir -p /tmp/optris-skia-c/src/c
+          for file in sk_types_priv.h gr_context.cpp; do
+            curl -fsSL -o "/tmp/optris-skia-c/src/c/$file" \
+              "https://raw.githubusercontent.com/mono/skia/${skia_sha}/src/c/$file"
+          done
+
+          python3 scripts/patch-skia-gl-stubs.py /tmp/optris-skia-c
+
+          # Applying is necessary but not sufficient: a patch that ran and changed nothing would
+          # also "succeed". Assert the macro and the re-guarded call sites are actually there.
+          grep -q 'define SK_ONLY_GL' /tmp/optris-skia-c/src/c/sk_types_priv.h \
+            || { echo "::error::patch reported success but SK_ONLY_GL is not defined"; exit 1; }
+          grep -q 'SK_ONLY_GL(' /tmp/optris-skia-c/src/c/gr_context.cpp \
+            || { echo "::error::patch reported success but no call site was re-guarded"; exit 1; }

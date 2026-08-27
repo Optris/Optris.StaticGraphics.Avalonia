@@ -336,15 +336,22 @@ build_skia() {
     sync_skia_deps "$skia_dir"
   fi
 
-  # Ganesh stays ON for every tier, including Software, and skia_use_gl is what actually
-  # distinguishes them.
-  # This was skia_enable_ganesh = false for Software, which is the tidier expression of "no GPU
-  # pipeline at all" and does not compile - this platform is where it was caught:
+  # SkiaSharp's C API has no SK_ONLY_GL, so skia_use_gl=false does not stub the GL entry points
+  # and they fail to compile against declarations that are gone. This adds the missing macro.
+  # It runs for every tier because it is a no-op wherever SK_GL is defined, and the tiers share
+  # this checkout. See the header of the script for the full story.
+  python3 "$ROOT_DIR/scripts/patch-skia-gl-stubs.py" "$skia_dir"
+
+  # Ganesh stays ON for every tier, and skia_use_gl is what separates them.
+  # The tidier expression of "no GPU pipeline at all" would be skia_enable_ganesh = false, and it
+  # does not compile - this platform is where it was caught:
   #   src/c/gr_context.cpp:46: error: non-void function
   #   'gr_recording_context_get_direct_context' should return a value
-  # SkiaSharp's C API assumes Ganesh exists; SK_ONLY_GPU collapses to nothing and leaves the
-  # function with no return. The C API stubs absent BACKENDS but not an absent pipeline.
-  # Turning GL off instead keeps the API compiling and still satisfies assert_tier_symbols,
+  # SK_ONLY_GPU collapses to nothing, leaving that single-argument use with no return. It would
+  # also strip SkSurfaces::WrapBackendRenderTarget and SkImages::BorrowTextureFrom out from under
+  # src/c/sk_surface.cpp and src/c/sk_image.cpp, which use them with no guard at all - and that
+  # break surfaces at the CONSUMER's link, not here, which is the worst place to find it.
+  # Keeping Ganesh and dropping GL leaves only the raster path and satisfies assert_tier_symbols,
   # because GrGLGpu and GrGLInterface are compiled only when skia_use_gl is true.
   local skia_enable_ganesh="true"
   local skia_use_gl="false"
