@@ -613,9 +613,14 @@ jobs:
           # asked for explicitly - llvmpipe is not what an unconfigured libGL picks.
           launcher=""
           case "$RID" in
-            linux-*)
-              launcher="xvfb-run -a --server-args=-screen 0 1280x1024x24 +extension GLX +extension RANDR +render -noreset"
-              ;;
+            # Just "xvfb-run -a", and no --server-args: SMOKE_LAUNCHER is word-split where it is
+            # used, so an argument containing spaces comes apart - "--server-args=-screen" became
+            # one argument and "0" became a command, and xvfb-run died with "184: 0: not found",
+            # breaking even the Software legs that had been passing.
+            # Nothing is lost by dropping it. Debian's xvfb-run already defaults to
+            # "-screen 0 1280x1024x24" and its Xvfb enables GLX; what the OpenGL legs were actually
+            # missing is the software rasteriser selected by the environment below.
+            linux-*) launcher="xvfb-run -a" ;;
           esac
 
           {
