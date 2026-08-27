@@ -459,34 +459,17 @@ jobs:
       fail-fast: false
       matrix:
         tier: ${{ fromJSON(needs.preflight.outputs.tiers) }}
-        rid: [win-x64, win-x86, win-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, osx-x64, osx-arm64]
-        # Dropped rather than gated with a job-level `if`: the matrix context is not available
-        # there, so such a condition silently evaluates true and the job runs anyway. exclude is
-        # evaluated with the inputs context, which is. The osx entries stay in the list above so
-        # turning include_macos on needs no matrix surgery.
-        exclude: ${{ fromJSON(inputs.include_macos && '[]' || '[{"rid":"osx-x64"},{"rid":"osx-arm64"}]') }}
-        include:
-          - rid: win-x64
-            runner: windows-2022
-            msvc_arch: x64
-          - rid: win-x86
-            runner: windows-2022
-            msvc_arch: x86
-          - rid: win-arm64
-            runner: windows-2022
-            msvc_arch: amd64_arm64
-          - rid: linux-x64
-            runner: ubuntu-24.04
-          - rid: linux-arm64
-            runner: ubuntu-24.04-arm
-          - rid: linux-musl-x64
-            runner: ubuntu-24.04
-          - rid: linux-musl-arm64
-            runner: ubuntu-24.04-arm
-          - rid: osx-x64
-            runner: macos-15
-          - rid: osx-arm64
-            runner: macos-15
+        # rid and include are BOTH switched together, and there is no `exclude` here on purpose.
+        # GitHub processes include AFTER exclude and documents it as a way to add back combinations
+        # exclude removed - so an excluded rid that still appears in include comes straight back,
+        # and because include supplies no `tier` it returns as a tier-less combination. That is not
+        # hypothetical: excluding the osx rids produced two extra jobs named "Smoke  osx-arm64",
+        # with the empty tier visible in the double space, which then failed on an unknown tier.
+        # Switching both lists leaves nothing for include to resurrect.
+        # (A job-level `if` is still not an option: the matrix context does not exist there, so the
+        # condition silently evaluates true and the job runs regardless.)
+        rid: ${{ fromJSON(inputs.include_macos && '["win-x64","win-x86","win-arm64","linux-x64","linux-arm64","linux-musl-x64","linux-musl-arm64","osx-x64","osx-arm64"]' || '["win-x64","win-x86","win-arm64","linux-x64","linux-arm64","linux-musl-x64","linux-musl-arm64"]') }}
+        include: ${{ fromJSON(inputs.include_macos && '[{"rid":"win-x64","runner":"windows-2022","msvc_arch":"x64"},{"rid":"win-x86","runner":"windows-2022","msvc_arch":"x86"},{"rid":"win-arm64","runner":"windows-2022","msvc_arch":"amd64_arm64"},{"rid":"linux-x64","runner":"ubuntu-24.04"},{"rid":"linux-arm64","runner":"ubuntu-24.04-arm"},{"rid":"linux-musl-x64","runner":"ubuntu-24.04"},{"rid":"linux-musl-arm64","runner":"ubuntu-24.04-arm"},{"rid":"osx-x64","runner":"macos-15"},{"rid":"osx-arm64","runner":"macos-15"}]' || '[{"rid":"win-x64","runner":"windows-2022","msvc_arch":"x64"},{"rid":"win-x86","runner":"windows-2022","msvc_arch":"x86"},{"rid":"win-arm64","runner":"windows-2022","msvc_arch":"amd64_arm64"},{"rid":"linux-x64","runner":"ubuntu-24.04"},{"rid":"linux-arm64","runner":"ubuntu-24.04-arm"},{"rid":"linux-musl-x64","runner":"ubuntu-24.04"},{"rid":"linux-musl-arm64","runner":"ubuntu-24.04-arm"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
