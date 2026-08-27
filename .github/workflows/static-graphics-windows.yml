@@ -105,7 +105,13 @@ jobs:
           New-Item -ItemType Directory -Force -Path $staging | Out-Null
           # The tier root the script picked is irrelevant here, so collect by name and skip the
           # build tree, which holds intermediate copies of the same archives.
-          foreach ($name in @("libANGLE_static.lib", "libGLESv2_static.lib", "libc++.lib", "libc++abi.lib")) {
+          # angle-branch.txt is not an archive: it is what the build recorded about the checkout
+          # it actually made, and the package check reads it so the branch a package advertises
+          # is compared against the builder rather than against the property that generated the
+          # claim. Collected here because this step, not the build, decides what reaches the
+          # artifact - which is why the first attempt at that cross-check failed with the file
+          # written and never shipped.
+          foreach ($name in @("libANGLE_static.lib", "libGLESv2_static.lib", "libc++.lib", "libc++abi.lib", "angle-branch.txt")) {
             $hit = Get-ChildItem -Path "External/NativeStatic" -Recurse -File -Filter $name -ErrorAction SilentlyContinue |
               Where-Object { $_.FullName -notmatch "[\\/]\.work[\\/]" } |
               Select-Object -First 1

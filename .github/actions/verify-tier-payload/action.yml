@@ -102,6 +102,13 @@ runs:
             return found
 
         sanity = ["SkSurface", "SkCanvas", "SkImage"]
+        # On macOS the top tier is spelled "Vulkan" like everywhere else but is DELIVERED by
+        # Metal: Vulkan only reaches Apple hardware through MoltenVK, which Skia does not
+        # vendor, so build-macos-static-graphics.sh sets skia_use_metal for this tier and
+        # never sets skia_use_vulkan. That rule lived only in the build script; this verifier
+        # asked every unix RID for GrVkGpu and so failed both osx legs the first time macOS
+        # was let into the release path, on archives that were exactly right.
+        metal_gpu = ["GrMtlGpu"]
         vulkan_gpu = ["GrVkGpu"]
         vulkan_context = ["GrVkBackendContext", "VulkanBackendContext"]
         vulkan_vma = [
@@ -109,7 +116,7 @@ runs:
             "GrVkMemoryAllocator", "VmaAllocator", "vmaCreateAllocator",
         ]
         gl = ["GrGLInterface", "GrGLGpu"]
-        probes = sanity + vulkan_gpu + vulkan_context + vulkan_vma + gl
+        probes = sanity + metal_gpu + vulkan_gpu + vulkan_context + vulkan_vma + gl
 
         for rid, archive in sorted(skia_archives.items()):
             if archive is None:
@@ -123,22 +130,34 @@ runs:
                 )
                 continue
             print(f"{rid}: {sorted(found)}")
+            top_gpu = metal_gpu if rid.startswith("osx-") else vulkan_gpu
             if tier == "Vulkan":
-                if not found & set(vulkan_gpu):
+                if rid.startswith("osx-"):
+                    # Metal carries no separate context or allocator probe the way Vulkan does; the
+                    # GPU symbol is the whole claim here, and it is the same one the macOS build
+                    # script asserts before it hands the archive over.
+                    if not found & set(metal_gpu):
+                        failures.append(
+                            f"{rid}: Vulkan tier but skia contains no {metal_gpu}. On macOS this tier "
+                            "is delivered by Metal, and SkiaSharp stubs an absent backend rather than "
+                            "dropping it, so every context would come back null and the window would "
+                            "render blank with no error"
+                        )
+                elif not found & set(vulkan_gpu):
                     failures.append(
                         f"{rid}: Vulkan tier but skia contains no {vulkan_gpu}. SkiaSharp stubs the "
                         "absent backend rather than dropping it, so every Vulkan context would come "
                         "back null and the window would render blank with no error"
                     )
-                if not found & set(vulkan_context):
+                if not rid.startswith("osx-") and not found & set(vulkan_context):
                     failures.append(f"{rid}: Vulkan tier but skia contains none of {vulkan_context}")
-                if not found & set(vulkan_vma):
+                if not rid.startswith("osx-") and not found & set(vulkan_vma):
                     failures.append(
                         f"{rid}: Vulkan tier but skia contains no memory allocator ({vulkan_vma}). "
                         "Without VMA the failure looks exactly like no Vulkan at all"
                     )
             else:
-                leaked = found & set(vulkan_gpu + vulkan_vma)
+                leaked = found & set(top_gpu + (vulkan_vma if not rid.startswith("osx-") else []))
                 if leaked:
                     failures.append(f"{rid}: tier {tier} must not contain Vulkan symbols, found {sorted(leaked)}")
             if tier in ("Vulkan", "OpenGL"):
