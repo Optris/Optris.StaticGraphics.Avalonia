@@ -234,7 +234,15 @@ tier_symbol_lines() {
 # type U for an undefined one. Only a defined symbol proves the code is really compiled into
 # the archive rather than merely referenced by it.
 symbol_defined() {
-  grep -F -- "$2" <<<"$1" | grep -Eq '^[0-9a-fA-F]+[[:space:]]+[^Uu[:space:]][[:space:]]'
+  # Deliberately NOT one pipeline. `grep -q` exits at its first match, the upstream grep then
+  # dies writing to a closed pipe, and `set -o pipefail` turns that into a non-zero status - so
+  # this reports "not defined" for a symbol that is plainly defined. It only bites once the
+  # filtered set is big enough for the reader to still be writing when the tester quits, which is
+  # why a narrow TIER_SYMBOL_PATTERN hid it: the moment the reader's own proof-of-life symbols
+  # joined the filter, every glibc build started failing its own sanity check.
+  local matches
+  matches="$(grep -F -- "$2" <<<"$1")" || return 1
+  grep -Eq '^[0-9a-fA-F]+[[:space:]]+[^Uu[:space:]][[:space:]]' <<<"$matches"
 }
 
 symbol_mentioned() {
