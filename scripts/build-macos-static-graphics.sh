@@ -154,7 +154,10 @@ resolve_llvm_nm() {
 
 # Every name the tier contract cares about. One nm pass over a multi-hundred-MB archive is
 # expensive, so the output is filtered down to these once and then queried in memory.
-TIER_SYMBOL_PATTERN='GrMtlGpu|GrMtlCaps|GrVkGpu|AMDMemoryAllocator|GrGLGpu|GrGLInterface|vkCreateInstance'
+# SkCanvas/SkSurface/SkImage are not part of the contract; they are the reader's own proof of
+# life, and they have to survive this filter for assert_tier_symbols to be able to check it.
+TIER_SYMBOL_PATTERN='GrMtlGpu|GrMtlCaps|GrVkGpu|AMDMemoryAllocator|GrGLGpu|GrGLInterface|vkCreateInstance|SkCanvas|SkSurface|SkImage'
+READER_SANITY_SYMBOLS=(SkCanvas SkSurface SkImage)
 
 tier_symbol_lines() {
   local library="$1"
@@ -199,8 +202,33 @@ assert_tier_symbols() {
   if [ -z "$lines" ]; then
     echo "Symbol reader returned nothing for $library." >&2
     echo "That is a broken reader, not a verdict: even a Software build contains Skia's own" >&2
-    echo "symbols, so the pattern should always match something. Check which nm was selected" >&2
-    echo "and that it can read a static archive on this platform." >&2
+    echo "symbols, so the pattern should always match something. Reader was: $(resolve_llvm_nm)" >&2
+    return 1
+  fi
+
+  # Non-empty is not the same as trustworthy. macOS is the platform that showed this first: it
+  # reported every backend missing from an archive that had just compiled cleanly, which reads
+  # exactly like a real gap and is why macOS is currently built out of the release path. The
+  # same shape then appeared on musl, where the build log proved GrVkGpu.cpp and GrGLGpu.cpp had
+  # compiled and the reader still said they were absent.
+  # So the reader must prove itself on this archive before any "not defined" verdict counts.
+  # SkCanvas/SkSurface/SkImage are in every Skia build ever configured; if none reads back as
+  # *defined* - the same predicate the contract checks use, so this exercises the whole pipeline
+  # rather than just "nm emitted bytes" - the tool cannot read this file and has told us nothing.
+  local probe reader_proved=""
+  for probe in "${READER_SANITY_SYMBOLS[@]}"; do
+    if symbol_defined "$lines" "$probe"; then
+      reader_proved="$probe"
+      break
+    fi
+  done
+  if [ -z "$reader_proved" ]; then
+    echo "Symbol reader cannot be trusted for $library." >&2
+    echo "It produced output, but none of ${READER_SANITY_SYMBOLS[*]} came back as a defined" >&2
+    echo "symbol. Every Skia build contains all of them, so this is a reader that cannot parse" >&2
+    echo "this archive - not a verdict about which backends the archive holds." >&2
+    echo "Reader was: $(resolve_llvm_nm)" >&2
+    echo "Set LLVM_NM to an llvm-nm matching the clang that produced the archive." >&2
     return 1
   fi
 

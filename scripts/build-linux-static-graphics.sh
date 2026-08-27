@@ -167,6 +167,16 @@ resolve_llvm_nm() {
   fi
   candidates+=("$WORK_DIR/depot_tools/llvm-build/Release+Asserts/bin/llvm-nm")
 
+  # Alpine's llvm package installs only a versioned tree - /usr/lib/llvm19/bin/llvm-nm and no
+  # /usr/bin/llvm-nm - so every name below misses it and resolution falls through to GNU nm,
+  # which cannot read the LTO bitcode archives is_official_build produces. That fallback is how
+  # musl came to report backends missing from an archive that demonstrably contained them.
+  # Newest first, so a box with several LLVM versions gets the one most likely to match clang.
+  local versioned
+  while IFS= read -r versioned; do
+    [[ -n "$versioned" ]] && candidates+=("$versioned")
+  done < <(ls -1d /usr/lib/llvm*/bin/llvm-nm /usr/lib/llvm-*/bin/llvm-nm 2>/dev/null | sort -Vr)
+
   local candidate
   for candidate in "${candidates[@]}"; do
     if [[ -x "$candidate" ]]; then
@@ -201,7 +211,10 @@ resolve_llvm_nm() {
 
 # Every name the tier contract cares about. One nm pass over a multi-hundred-MB archive is
 # expensive, so the output is filtered down to these once and then queried in memory.
-TIER_SYMBOL_PATTERN='GrVkGpu|GrVkCaps|GrVkBackendContext|AMDMemoryAllocator|GrGLGpu|GrGLInterface|vkCreateInstance'
+# SkCanvas/SkSurface/SkImage are not part of the contract; they are the reader's own proof of
+# life, and they have to survive this filter for assert_tier_symbols to be able to check it.
+TIER_SYMBOL_PATTERN='GrVkGpu|GrVkCaps|GrVkBackendContext|AMDMemoryAllocator|GrGLGpu|GrGLInterface|vkCreateInstance|SkCanvas|SkSurface|SkImage'
+READER_SANITY_SYMBOLS=(SkCanvas SkSurface SkImage)
 
 tier_symbol_lines() {
   local library="$1"
@@ -242,14 +255,42 @@ assert_tier_symbols() {
   # A reader that returns nothing is the dangerous case, not an obvious one: every "must be
   # defined" check fails, which looks like a broken build, while every "must not contain" check
   # PASSES - so the Software tier would sail through on an empty read and ship unverified. That
-  # is the same silent-pass shape this repository exists to prevent. Caught on musl, where the
-  # Alpine image had no nm at all and every backend was reported missing from an archive that
-  # had just compiled cleanly.
+  # is the same silent-pass shape this repository exists to prevent.
   if [ -z "$lines" ]; then
     echo "Symbol reader returned nothing for $library." >&2
     echo "That is a broken reader, not a verdict: even a Software build contains Skia's own" >&2
-    echo "symbols, so the pattern should always match something. Check which nm was selected" >&2
-    echo "and that it exists in this environment (Alpine needs binutils or llvm)." >&2
+    echo "symbols, so the pattern should always match something. Reader was: $(resolve_llvm_nm)" >&2
+    return 1
+  fi
+
+  # Non-empty is not the same as trustworthy, and the difference has already cost us. On musl
+  # this function reported GrVkGpu, GrGLGpu and GrGLInterface all missing from an archive whose
+  # own build log showed GrVkGpu.cpp and GrGLGpu.cpp compiling - 32 Vulkan and 32 GL sources,
+  # the identical 1194-target build that passed on glibc. The verdict was false, it read exactly
+  # like a real backend gap, and a RID was dropped on the strength of it. The earlier "no nm at
+  # all" fix made this worse rather than better: installing binutils satisfied the emptiness
+  # check with a GNU nm that cannot parse LTO bitcode archives, turning a loud failure into a
+  # confident wrong answer.
+  # So the reader must prove itself on this archive before any of its "not defined" verdicts
+  # count. SkCanvas/SkSurface/SkImage are in every Skia build ever configured; if none of them
+  # reads back as *defined* - the same predicate the contract checks use, so this exercises the
+  # whole pipeline and not just "nm emitted bytes" - then the tool cannot read this file and it
+  # has told us nothing about which backends are in it.
+  local probe reader_proved=""
+  for probe in "${READER_SANITY_SYMBOLS[@]}"; do
+    if symbol_defined "$lines" "$probe"; then
+      reader_proved="$probe"
+      break
+    fi
+  done
+  if [ -z "$reader_proved" ]; then
+    echo "Symbol reader cannot be trusted for $library." >&2
+    echo "It produced output, but none of ${READER_SANITY_SYMBOLS[*]} came back as a defined" >&2
+    echo "symbol. Every Skia build contains all of them, so this is a reader that cannot parse" >&2
+    echo "this archive - not a verdict about which backends the archive holds." >&2
+    echo "Reader was: $(resolve_llvm_nm)" >&2
+    echo "The usual cause is GNU nm on an LTO archive: is_official_build compiles to LLVM" >&2
+    echo "bitcode, which only a matching llvm-nm can read. Set LLVM_NM to one." >&2
     return 1
   fi
 

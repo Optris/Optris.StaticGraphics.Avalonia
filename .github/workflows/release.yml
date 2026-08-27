@@ -446,9 +446,7 @@ jobs:
         # there, so such a condition silently evaluates true and the job runs anyway. exclude is
         # evaluated with the inputs context, which is. The osx entries stay in the list above so
         # turning include_macos on needs no matrix surgery.
-        # linux-musl-arm64 is dropped in static-graphics-musl.yml too - no payload is built for
-        # it, so there is nothing to smoke.
-        exclude: ${{ fromJSON(inputs.include_macos && '[{"rid":"linux-musl-arm64"}]' || '[{"rid":"osx-x64"},{"rid":"osx-arm64"},{"rid":"linux-musl-arm64"}]') }}
+        exclude: ${{ fromJSON(inputs.include_macos && '[]' || '[{"rid":"osx-x64"},{"rid":"osx-arm64"}]') }}
         include:
           - rid: win-x64
             runner: windows-2022

@@ -158,7 +158,10 @@ function Resolve-Dumpbin {
 
 # Every name the tier contract cares about. One llvm-nm pass over a multi-hundred-MB archive
 # is expensive, so the output is filtered down to these once and then queried in memory.
-$script:TierSymbolPattern = 'GrVkGpu|GrVkCaps|GrVkBackendContext|AMDMemoryAllocator|GrGLGpu|GrGLInterface|vkCreateInstance'
+# SkCanvas/SkSurface/SkImage are not part of the contract; they are the reader's own proof of
+# life, and they have to survive this filter for Assert-TierSymbols to be able to check it.
+$script:TierSymbolPattern = 'GrVkGpu|GrVkCaps|GrVkBackendContext|AMDMemoryAllocator|GrGLGpu|GrGLInterface|vkCreateInstance|SkCanvas|SkSurface|SkImage'
+$script:ReaderSanitySymbols = @("SkCanvas", "SkSurface", "SkImage")
 
 function Get-TierSymbolLines($Library) {
     $llvmNm = Resolve-LlvmNm
@@ -222,6 +225,34 @@ function Assert-TierSymbols($Library) {
     # guard and the published backend list would then be lying in the other direction.
     $lines = Get-TierSymbolLines $Library
     $failures = [System.Collections.Generic.List[string]]::new()
+
+    # Every "is not defined" verdict below is only as good as the reader that produced it, and a
+    # reader that cannot parse the archive reports every backend missing - which reads exactly
+    # like a real build gap. That false verdict has already cost this repository a dropped RID on
+    # musl, where the build log showed GrVkGpu.cpp and GrGLGpu.cpp compiling while this check
+    # said they were absent. Windows has two readers (llvm-nm and the dumpbin fallback), so it has
+    # two chances to be silently wrong; a build that went "unverified" through the fallback is the
+    # exact outcome this function exists to prevent.
+    # SkCanvas/SkSurface/SkImage are in every Skia build ever configured. Proving one of them is
+    # *defined* - through the same Test-DefinedSymbol the contract uses, so the whole pipeline is
+    # exercised and not merely "the tool emitted bytes" - is what makes the rest of this evidence.
+    $readerProved = $null
+    foreach ($probe in $script:ReaderSanitySymbols) {
+        if (Test-DefinedSymbol $lines $probe) {
+            $readerProved = $probe
+            break
+        }
+    }
+    if (-not $readerProved) {
+        throw @"
+Symbol reader cannot be trusted for $Library.
+It returned $($lines.Count) line(s), but none of $($script:ReaderSanitySymbols -join ', ') came
+back as a defined symbol. Every Skia build contains all of them, so this is a reader that cannot
+parse this archive - not a verdict about which backends the archive holds.
+Check which reader was selected (llvm-nm, else the dumpbin fallback) and that it can read a
+static archive built by this toolchain.
+"@
+    }
 
     if ($Backends -contains "Vulkan") {
         # GrVkAMDMemoryAllocator/skgpu::VulkanAMDMemoryAllocator is not optional: Skia's
