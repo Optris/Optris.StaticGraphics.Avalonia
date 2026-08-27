@@ -37,7 +37,12 @@ jobs:
       fail-fast: false
       matrix:
         tier: ${{ fromJSON(inputs.tiers) }}
-        rid: [linux-musl-x64, linux-musl-arm64]
+        # linux-musl-arm64 is out until Skia's GL backend actually builds there. With a working
+        # symbol reader (Alpine needed binutils) the archive is genuinely missing GrGLGpu and
+        # GrGLInterface while Vulkan is present, so this is a real gap in that target rather than
+        # a tooling artifact - and a tier that claims OpenGL must contain it. Alpine on ARM is a
+        # narrow target; the other three musl/glibc combinations are unaffected.
+        rid: [linux-musl-x64]
         include:
           - rid: linux-musl-x64
             target_cpu: x64
