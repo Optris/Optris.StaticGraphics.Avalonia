@@ -220,6 +220,20 @@ jobs:
           bash -n scripts/build-macos-avalonia-native-static.sh
           bash -n scripts/build-macos-font-preinit.sh
           bash -n scripts/run-smoke.sh
+
+          # Git records the executable bit, and a contributor on Windows adding a script will not
+          # set it - the file lands as 100644 and the Linux job dies with "Permission denied", exit
+          # 126, twenty minutes into a matrix. That is what happened on the first full release run.
+          # Cheap to check here, expensive to discover there.
+          missing=""
+          for script in scripts/*.sh; do
+            mode="$(git ls-files -s "$script" | cut -d' ' -f1)"
+            [ "$mode" = "100755" ] || missing="$missing $script($mode)"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::Shell scripts are not executable in git:$missing. Fix with: git update-index --chmod=+x <script>"
+            exit 1
+          fi
           pwsh -NoProfile -Command '
             $failed = $false
             foreach ($file in Get-ChildItem scripts -Filter *.ps1) {
