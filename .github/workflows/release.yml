@@ -265,6 +265,10 @@ jobs:
           tier: ${{ matrix.tier }}
           package: artifacts/nuget/Optris.StaticGraphics.Avalonia.${{ matrix.tier }}.${{ needs.preflight.outputs.package_version }}.nupkg
           angle_branch: ${{ needs.preflight.outputs.angle_branch }}
+          # Must track the payload verifier above. Without it this asks a package built without
+          # macOS for its osx archives and fails every tier at the last step - which is exactly
+          # what happened once the builds themselves finally went green.
+          include_macos: ${{ inputs.include_macos }}
 
       - name: 📤 Upload NuGet package
         uses: actions/upload-artifact@v7

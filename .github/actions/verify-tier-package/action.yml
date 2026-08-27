@@ -11,6 +11,13 @@ inputs:
   angle_branch:
     description: Chromium branch the ANGLE archives came from
     required: true
+  include_macos:
+    description: >-
+      Whether the osx RIDs are expected in this package. Mirrors the input of the same name on
+      verify-tier-payload: when macOS is built out of the release path there is no osx payload to
+      pack, so requiring one here fails every Pack job on archives that were never produced.
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -21,6 +28,7 @@ runs:
         TIER: ${{ inputs.tier }}
         PACKAGE: ${{ inputs.package }}
         ANGLE_BRANCH: ${{ inputs.angle_branch }}
+        INCLUDE_MACOS: ${{ inputs.include_macos }}
       run: |
         python3 - <<'PY'
         import os
@@ -88,7 +96,9 @@ runs:
             # The package is what consumers actually get, so presence and absence are asserted
             # here too and not only on the payload directory the pack step assembled.
             windows_rids = ["win-x64", "win-x86", "win-arm64"]
-            unix_rids = ["linux-x64", "linux-arm64", "linux-musl-x64", "linux-musl-arm64", "osx-x64", "osx-arm64"]
+            unix_rids = ["linux-x64", "linux-arm64", "linux-musl-x64", "linux-musl-arm64"]
+            if os.environ.get("INCLUDE_MACOS", "false").lower() == "true":
+                unix_rids += ["osx-x64", "osx-arm64"]
             angle_stems = ("libANGLE_static.", "libGLESv2_static.")
             for rid in windows_rids + unix_rids:
                 entries = [name for name in names if f"/{rid}/" in name]
