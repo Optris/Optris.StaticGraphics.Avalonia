@@ -191,6 +191,19 @@ assert_tier_symbols() {
   local lines failures=() name
   lines="$(tier_symbol_lines "$library")"
 
+  # A reader that returns nothing is the dangerous case, not an obvious one: every "must be
+  # defined" check fails, which looks like a broken build, while every "must not contain" check
+  # PASSES - so the Software tier would sail through on an empty read and ship unverified. That is
+  # the same shape as the defect this repository exists to prevent, so an empty result is treated
+  # as a broken tool rather than as evidence about the archive.
+  if [ -z "$lines" ]; then
+    echo "Symbol reader returned nothing for $library." >&2
+    echo "That is a broken reader, not a verdict: even a Software build contains Skia's own" >&2
+    echo "symbols, so the pattern should always match something. Check which nm was selected" >&2
+    echo "and that it can read a static archive on this platform." >&2
+    return 1
+  fi
+
   if tier_claims Vulkan; then
     if ! symbol_defined "$lines" "GrMtlGpu"; then
       failures+=("tier '$TIER' claims the top GPU backend but 'GrMtlGpu' is not defined in $library")
