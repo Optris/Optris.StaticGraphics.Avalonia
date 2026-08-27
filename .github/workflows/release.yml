@@ -45,9 +45,9 @@ on:
         default: false
         type: boolean
       include_macos:
-        description: Build and ship the osx RIDs (off - the macOS symbol reader is unreliable)
+        description: Build and ship the osx RIDs
         required: false
-        default: false
+        default: true
         type: boolean
   workflow_call:
     inputs:
@@ -81,7 +81,7 @@ on:
         type: boolean
       include_macos:
         required: false
-        default: false
+        default: true
         type: boolean
 
 concurrency:
@@ -159,9 +159,14 @@ jobs:
 
   build-macos:
     needs: preflight
-    # Opt-in. The macOS symbol reader reports every backend missing from an archive that has just
-    # compiled cleanly, so the tier contract cannot be verified there - and shipping a tier whose
-    # contract was not checked is the exact thing this repository exists to refuse.
+    # macOS was opt-in because the symbol reader "reported every backend missing from an archive
+    # that had just compiled cleanly". That was never a macOS fault: symbol_defined piped grep -F
+    # into grep -q, and under pipefail the closed-pipe status turned EVERY symbol into "not
+    # defined". macOS just tripped it first, its nm output for those names being large enough to
+    # lose the race that Linux's narrow filter kept winning. With that fixed, both osx RIDs verify
+    # their tier contract cleanly, so macOS is back in the release path where it belongs.
+    # The flag stays as an escape hatch - macOS runners are the scarcest and slowest here - but
+    # it is now a choice about build time, not a gap in what we can verify.
     if: ${{ inputs.include_macos }}
     uses: ./.github/workflows/static-graphics-macos.yml
     with:

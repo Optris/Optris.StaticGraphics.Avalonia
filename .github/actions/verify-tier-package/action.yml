@@ -13,9 +13,9 @@ inputs:
     required: true
   include_macos:
     description: >-
-      Whether the osx RIDs are expected in this package. Mirrors the input of the same name on
-      verify-tier-payload: when macOS is built out of the release path there is no osx payload to
-      pack, so requiring one here fails every Pack job on archives that were never produced.
+      Whether the osx RIDs are expected in this package. Must track verify-tier-payload's input of
+      the same name: a run that skipped the macOS runners has no osx payload to pack, and requiring
+      one here fails every Pack job on archives that were never produced.
     required: false
     default: "false"
 

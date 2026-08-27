@@ -11,9 +11,9 @@ inputs:
     default: ""
   include_macos:
     description: >-
-      Whether the osx RIDs are expected in this payload. The macOS symbol reader is unreliable
-      (an archive that had just compiled cleanly reported every backend missing), so macOS is
-      currently built out of the release path rather than shipped unverified.
+      Whether the osx RIDs are expected in this payload. macOS is built by default; this exists so
+      a run that deliberately skips the slow macOS runners is not then failed for the archives it
+      was told not to build.
     required: false
     default: "false"
 
