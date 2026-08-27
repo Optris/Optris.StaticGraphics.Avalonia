@@ -127,10 +127,34 @@ jobs:
             echo "::error::Could not determine the latest stable Avalonia version."
             exit 1
           fi
-          revision="$(curl --silent --location \
-            https://api.nuget.org/v3-flatcontainer/optris.staticgraphics.avalonianative/index.json \
-            | jq -r --arg v "$version" '[.versions[]? | select(startswith($v + ".")) | split(".")[3] | tonumber] | (max // 0) + 1' 2>/dev/null || echo 1)"
-          [ -n "$revision" ] && [ "$revision" != "null" ] || revision=1
+          # A half-answered query must never become a version number. This used to collapse any
+          # transport error, 404 or jq failure into revision=1 - the assertion "nothing of this
+          # Avalonia version is published yet" - and when that was wrong, `dotnet nuget push
+          # --skip-duplicate` exited 0 without publishing while the release notes advertised the
+          # version as shipped. A green run, and consumers get the older bits. Preflight refuses
+          # this exact assumption on principle for the tier packages; AvaloniaNative was the one
+          # nobody guarded. 404 is the single case where 1 is a fact rather than a guess: the id
+          # has never been published at all.
+          index="$(mktemp)"
+          status="$(curl --silent --location --output "$index" --write-out '%{http_code}' \
+            https://api.nuget.org/v3-flatcontainer/optris.staticgraphics.avalonianative/index.json || echo 000)"
+          case "$status" in
+            200)
+              revision="$(jq -r --arg v "$version" '[.versions[]? | select(startswith($v + ".")) | split(".")[3] | tonumber] | (max // 0) + 1' <"$index")" || {
+                echo "::error::nuget.org returned an AvaloniaNative index that could not be parsed. Refusing to guess a revision."
+                exit 1
+              }
+              ;;
+            404) revision=1 ;;
+            *)
+              echo "::error::Could not read published AvaloniaNative versions from nuget.org (HTTP $status). Refusing to guess a revision - assuming 'not published' is how a run silently republishes an older build."
+              exit 1
+              ;;
+          esac
+          if [ -z "$revision" ] || [ "$revision" = "null" ]; then
+            echo "::error::Computed an empty AvaloniaNative revision from the nuget.org index."
+            exit 1
+          fi
           echo "avalonia_version=$version" >> "$GITHUB_OUTPUT"
           echo "package_version=$version.$revision" >> "$GITHUB_OUTPUT"
 
@@ -167,7 +191,7 @@ jobs:
     # their tier contract cleanly, so macOS is back in the release path where it belongs.
     # The flag stays as an escape hatch - macOS runners are the scarcest and slowest here - but
     # it is now a choice about build time, not a gap in what we can verify.
-    if: ${{ inputs.include_macos }}
+    if: ${{ (inputs.include_macos || github.event_name == 'push') }}
     uses: ./.github/workflows/static-graphics-macos.yml
     with:
       skiasharp_version: ${{ needs.preflight.outputs.skiasharp_version }}
@@ -239,7 +263,10 @@ jobs:
           if [ "$TIER" != "Software" ]; then
             for rid in win-x64 win-x86 win-arm64; do
               install -d "$root/$rid/native"
-              cp artifacts/angle/angle-static-"$rid"/* "$root/$rid/native/"
+              # Only the archives. angle-branch.txt rides along in the artifact as evidence for the
+              # package check below and must not end up inside the nupkg, where the payload
+              # verifier's strict per-RID listing would rightly object to it.
+              cp artifacts/angle/angle-static-"$rid"/*.lib "$root/$rid/native/"
             done
           fi
 
@@ -249,7 +276,7 @@ jobs:
         uses: ./.github/actions/verify-tier-payload
         with:
           tier: ${{ matrix.tier }}
-          include_macos: ${{ inputs.include_macos }}
+          include_macos: ${{ (inputs.include_macos || github.event_name == 'push') }}
 
       - name: 📦 Pack
         shell: bash
@@ -270,10 +297,14 @@ jobs:
           tier: ${{ matrix.tier }}
           package: artifacts/nuget/Optris.StaticGraphics.Avalonia.${{ matrix.tier }}.${{ needs.preflight.outputs.package_version }}.nupkg
           angle_branch: ${{ needs.preflight.outputs.angle_branch }}
+          # Written by the ANGLE build itself, from the checkout it actually made. Without it the
+          # branch check compares the generated props against the property that generated them and
+          # cannot fail. The Software tier ships no ANGLE and so has no record to point at.
+          angle_branch_evidence: ${{ matrix.tier != 'Software' && 'artifacts/angle/angle-static-win-x64/angle-branch.txt' || '' }}
           # Must track the payload verifier above. Without it this asks a package built without
           # macOS for its osx archives and fails every tier at the last step - which is exactly
           # what happened once the builds themselves finally went green.
-          include_macos: ${{ inputs.include_macos }}
+          include_macos: ${{ (inputs.include_macos || github.event_name == 'push') }}
 
       - name: 📤 Upload NuGet package
         uses: actions/upload-artifact@v7
@@ -338,7 +369,26 @@ jobs:
             echo "::error::Package contains Windows-only backslash paths."
             exit 1
           fi
-          unzip -Z1 "$package" | grep -E "osx-(x64|arm64)/native/libAvaloniaNative\.a"
+          # grep -E "osx-(x64|arm64)/..." succeeds on the FIRST matching line, so a package
+          # holding only one architecture passed a check that reads as "both are present". And
+          # macos_font_preinit.o was never asserted at all - the object whose absence shows up as
+          # text that never paints rather than as any kind of error. Every entry is named
+          # individually now, and the message says which one is missing.
+          entries="$(unzip -Z1 "$package")"
+          missing=""
+          for want in \
+            "static/osx-x64/native/libAvaloniaNative.a" \
+            "static/osx-arm64/native/libAvaloniaNative.a" \
+            "static/osx-x64/native/macos_font_preinit.o" \
+            "static/osx-arm64/native/macos_font_preinit.o"
+          do
+            printf '%s\n' "$entries" | grep -qxF "$want" || missing="$missing $want"
+          done
+          if [ -n "$missing" ]; then
+            echo "::error::AvaloniaNative package is missing:$missing"
+            printf '%s\n' "$entries"
+            exit 1
+          fi
 
       - name: 📤 Upload NuGet package
         uses: actions/upload-artifact@v7
@@ -425,12 +475,21 @@ jobs:
               )
               return result.returncode, result.stdout + result.stderr
 
+          # Counted, because the two checks below are the only ones here that can fail when the
+          # guard is broken - the positive probe builds fine whether or not OSG0001 still exists.
+          # Both sit under `if missing:`, which is EMPTY for the Vulkan tier, since that tier
+          # carries every backend. So a Vulkan-only run printed "Consumer guard behaves as
+          # specified" having never once watched OSG0001 fire or OSG0002 warn, and the publish
+          # gate then read that as proof the guard works.
+          negative_controls = 0
+
           for tier in tiers:
               code, log = build(tier, backends[tier], acknowledge=True)
               if code != 0:
                   failures.append(f"{tier}: a project requiring exactly {backends[tier]} failed to build:\n{log[-4000:]}")
               missing = [name for name in ("Vulkan", "OpenGL") if name not in backends[tier]]
               if missing:
+                  negative_controls += 1
                   code, log = build(tier, [missing[0]], acknowledge=True)
                   if code == 0:
                       failures.append(f"{tier}: requiring {missing[0]} built successfully; OSG0001 never fired")
@@ -440,9 +499,21 @@ jobs:
                   if "OSG0002" not in log:
                       failures.append(f"{tier}: reduced tier used without acknowledgement did not warn OSG0002")
 
+          if negative_controls == 0:
+              failures.append(
+                  f"no negative control ran. Every tier in {tiers} carries all backends, so neither "
+                  "OSG0001 (requiring an absent backend must FAIL the build) nor OSG0002 (an "
+                  "unacknowledged reduced tier must WARN) was ever exercised, and a regression in "
+                  "either would have passed unseen. Include a reduced tier - OpenGL or Software - "
+                  "in this run, or this job cannot claim the guard works."
+              )
+
           if failures:
               sys.exit("::error::" + "\n\n".join(failures))
-          print("Consumer guard behaves as specified.")
+          print(
+              f"Consumer guard behaves as specified: {negative_controls} negative control(s) "
+              f"observed across tiers {tiers}."
+          )
           PY
 
   smoke:
@@ -468,8 +539,8 @@ jobs:
         # Switching both lists leaves nothing for include to resurrect.
         # (A job-level `if` is still not an option: the matrix context does not exist there, so the
         # condition silently evaluates true and the job runs regardless.)
-        rid: ${{ fromJSON(inputs.include_macos && '["win-x64","win-x86","win-arm64","linux-x64","linux-arm64","linux-musl-x64","linux-musl-arm64","osx-x64","osx-arm64"]' || '["win-x64","win-x86","win-arm64","linux-x64","linux-arm64","linux-musl-x64","linux-musl-arm64"]') }}
-        include: ${{ fromJSON(inputs.include_macos && '[{"rid":"win-x64","runner":"windows-2022","msvc_arch":"x64"},{"rid":"win-x86","runner":"windows-2022","msvc_arch":"x86"},{"rid":"win-arm64","runner":"windows-2022","msvc_arch":"amd64_arm64"},{"rid":"linux-x64","runner":"ubuntu-24.04"},{"rid":"linux-arm64","runner":"ubuntu-24.04-arm"},{"rid":"linux-musl-x64","runner":"ubuntu-24.04"},{"rid":"linux-musl-arm64","runner":"ubuntu-24.04-arm"},{"rid":"osx-x64","runner":"macos-15"},{"rid":"osx-arm64","runner":"macos-15"}]' || '[{"rid":"win-x64","runner":"windows-2022","msvc_arch":"x64"},{"rid":"win-x86","runner":"windows-2022","msvc_arch":"x86"},{"rid":"win-arm64","runner":"windows-2022","msvc_arch":"amd64_arm64"},{"rid":"linux-x64","runner":"ubuntu-24.04"},{"rid":"linux-arm64","runner":"ubuntu-24.04-arm"},{"rid":"linux-musl-x64","runner":"ubuntu-24.04"},{"rid":"linux-musl-arm64","runner":"ubuntu-24.04-arm"}]') }}
+        rid: ${{ fromJSON((inputs.include_macos || github.event_name == 'push') && '["win-x64","win-x86","win-arm64","linux-x64","linux-arm64","linux-musl-x64","linux-musl-arm64","osx-x64","osx-arm64"]' || '["win-x64","win-x86","win-arm64","linux-x64","linux-arm64","linux-musl-x64","linux-musl-arm64"]') }}
+        include: ${{ fromJSON((inputs.include_macos || github.event_name == 'push') && '[{"rid":"win-x64","runner":"windows-2022","msvc_arch":"x64"},{"rid":"win-x86","runner":"windows-2022","msvc_arch":"x86"},{"rid":"win-arm64","runner":"windows-11-arm","msvc_arch":"arm64"},{"rid":"linux-x64","runner":"ubuntu-24.04"},{"rid":"linux-arm64","runner":"ubuntu-24.04-arm"},{"rid":"linux-musl-x64","runner":"ubuntu-24.04"},{"rid":"linux-musl-arm64","runner":"ubuntu-24.04-arm"},{"rid":"osx-x64","runner":"macos-15"},{"rid":"osx-arm64","runner":"macos-15"}]' || '[{"rid":"win-x64","runner":"windows-2022","msvc_arch":"x64"},{"rid":"win-x86","runner":"windows-2022","msvc_arch":"x86"},{"rid":"win-arm64","runner":"windows-11-arm","msvc_arch":"arm64"},{"rid":"linux-x64","runner":"ubuntu-24.04"},{"rid":"linux-arm64","runner":"ubuntu-24.04-arm"},{"rid":"linux-musl-x64","runner":"ubuntu-24.04"},{"rid":"linux-musl-arm64","runner":"ubuntu-24.04-arm"}]') }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
@@ -525,13 +596,26 @@ jobs:
 
           # Avalonia has no Vulkan backend on macOS, and the app refuses such a run with exit 3 rather
           # than accepting Metal in its place; a Vulkan tier is proven there by its other two backends.
+          # win-arm64 keeps OpenGL and Software but drops Vulkan: lavapipe publishes no arm64
+          # Windows build, so there is no software ICD to render with there. That single backend is
+          # the only part of win-arm64 that cannot be proven. It used to skip the app entirely and
+          # report the job green having drawn nothing at all - the failure shape this whole
+          # pipeline exists to refuse, sitting inside the step named for catching it.
           case "$RID" in
-            osx-*) backends="$(printf '%s\n' $backends | grep -vx Vulkan | tr '\n' ' ' || true)" ;;
+            osx-*|win-arm64) backends="$(printf '%s\n' $backends | grep -vx Vulkan | tr '\n' ' ' || true)" ;;
           esac
 
+          # GLX needs an X server that offers the extension AND a GL implementation behind it.
+          # A bare `xvfb-run -a` gave neither reliably: every Linux OpenGL leg failed with
+          # "X11PlatformOptions.RenderingMode has a value of Glx, but no options were applied",
+          # which is Avalonia reporting that the mode could not be initialised at all. The runner
+          # has no GPU, so the only GL available is Mesa's software rasteriser, and it has to be
+          # asked for explicitly - llvmpipe is not what an unconfigured libGL picks.
           launcher=""
           case "$RID" in
-            linux-*) launcher="xvfb-run -a" ;;
+            linux-*)
+              launcher="xvfb-run -a --server-args=-screen 0 1280x1024x24 +extension GLX +extension RANDR +render -noreset"
+              ;;
           esac
 
           {
@@ -542,6 +626,18 @@ jobs:
             echo "SMOKE_LOG_DIR=artifacts/smoke-logs/$TIER-$RID"
             echo "SMOKE_LAUNCHER=$launcher"
           } >> "$GITHUB_ENV"
+
+          # Force Mesa's software GL for the Linux legs. Without it libGL looks for a hardware
+          # driver, finds none, and GLX context creation fails - taking the OpenGL backend of
+          # every Linux tier with it, including the Vulkan tier, which must prove OpenGL too.
+          case "$RID" in
+            linux-*)
+              {
+                echo "LIBGL_ALWAYS_SOFTWARE=1"
+                echo "GALLIUM_DRIVER=llvmpipe"
+              } >> "$GITHUB_ENV"
+              ;;
+          esac
           echo "$TIER on $RID will be proven with: $backends"
 
       - name: 🔥 Publish single-file smoke app
@@ -584,6 +680,18 @@ jobs:
             "${{ env.DOTNET_ALPINE_IMAGE }}" `
             sh -c "apk add --no-cache clang lld build-base zlib-dev fontconfig-dev && dotnet publish /workspace/artifacts/avalonia-smoke-src/OptrisStaticGraphicsSmoke.csproj -c Release -r $env:RID --configfile /workspace/artifacts/avalonia-smoke-src/NuGet.config /p:PublishAot=true /p:SelfContained=true /p:PublishSingleFile=true /p:StripSymbols=true /p:PublishDir=/workspace/artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/"
 
+      # Read this for what it is: the seven filenames scanned below are exactly the ones
+      # OptrisStaticGraphicsCleanDynamicAssets deletes AfterTargets="Publish" whenever
+      # _OptrisStaticGraphicsLink is true - and that condition is derived from the RID STRING, not
+      # from whether any static archive was actually found and linked. So this step confirms the
+      # delete ran. It cannot, on its own, tell a static link from a dynamic one that had its
+      # libraries deleted out from under it.
+      # What actually proves the link is static is the smoke run: a binary that expected to load
+      # libSkiaSharp at runtime cannot render a frame once that file is gone, and the smoke step
+      # renders and inspects pixels on every RID - win-arm64 included, since it now runs on a real
+      # arm64 runner instead of being skipped. Keep this step for the cheap, early signal it gives
+      # (an unexpected dynamic library sitting next to the app), and do not read more into a pass
+      # than it can support.
       - name: ✅ Verify no dynamic graphics libraries remain
         shell: pwsh
         run: |
@@ -646,6 +754,33 @@ jobs:
           & 7z x $archive "-o$dest" -y "$arch/vulkan_lvp.dll" "$arch/$icdName" | Out-Null
           $icd = Join-Path $dest "$arch/$icdName"
           if (-not (Test-Path $icd)) { throw "lavapipe ICD not found at $icd after extraction." }
+
+          # An ICD is not reachable without a loader. vulkan-1.dll is what vkCreateInstance is
+          # resolved from, and installing lavapipe alone leaves nothing to load it: the Vulkan
+          # smoke then fails with Avalonia's generic "RenderingMode has a value of Vulkan, but no
+          # options were applied", which names the symptom and not the cause. Linux gets a loader
+          # from libvulkan1 in the apt line; Windows normally gets one from a GPU driver, and a
+          # GitHub runner has no GPU.
+          # Try the archive first (some mesa builds ship a loader beside the ICD), then the OS
+          # copy. If neither exists, say so here rather than letting it surface as a rendering
+          # mystery three steps later.
+          & 7z x $archive "-o$dest" -y "$arch/vulkan-1.dll" 2>$null | Out-Null
+          $bundledLoader = Join-Path $dest "$arch/vulkan-1.dll"
+          $systemLoader = Join-Path $env:SystemRoot "System32/vulkan-1.dll"
+          if (Test-Path $bundledLoader) {
+            Write-Host "Vulkan loader: $bundledLoader (from the mesa archive)"
+            # Beside the app is the first place Windows looks, and it beats any system copy.
+            "$dest/$arch" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          } elseif (Test-Path $systemLoader) {
+            Write-Host "Vulkan loader: $systemLoader (shipped with Windows)"
+          } else {
+            throw ("No Vulkan loader (vulkan-1.dll) on this runner, so the lavapipe ICD just " +
+                   "installed cannot be reached and the Vulkan smoke cannot run. Absent from both " +
+                   "the mesa archive and $systemLoader. Install the Vulkan runtime for this leg, " +
+                   "or drop Vulkan from the backends proven on $env:RID the way win-arm64 and " +
+                   "osx-* already do - but do not leave a tier claiming a backend no run has " +
+                   "ever exercised.")
+          }
           # VK_DRIVER_FILES restricts the loader to exactly this ICD, so a passing Vulkan smoke here
           # is proof the software driver drew it rather than something else on the machine.
           "VK_DRIVER_FILES=$icd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
@@ -656,12 +791,12 @@ jobs:
       # must be fine" branch, because a process that stays alive is precisely what the blank window
       # this repository exists to catch looks like. That branch is how the defect shipped upstream.
       - name: ▶️ Smoke the app, once per backend the tier promises
-        if: ${{ !startsWith(matrix.rid, 'linux-musl-') && matrix.rid != 'win-arm64' }}
+        if: ${{ !startsWith(matrix.rid, 'linux-musl-') }}
         shell: bash
         run: sh scripts/run-smoke.sh
 
       - name: 🧪 Prove the smoke test can fail
-        if: ${{ !startsWith(matrix.rid, 'linux-musl-') && matrix.rid != 'win-arm64' }}
+        if: ${{ !startsWith(matrix.rid, 'linux-musl-') }}
         shell: bash
         env:
           SMOKE_SELFTEST: "1"
@@ -785,9 +920,47 @@ jobs:
             exit 1
           fi
           ls -la
-          dotnet nuget push "*.nupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+          # Optris.StaticGraphics.AvaloniaNative is deliberately NOT pushed from here, and the
+          # exclusion is the point rather than an oversight. This job's gate requires
+          # needs.smoke.result == 'success', which reads as "everything published rendered a
+          # frame" - but the smoke matrix structurally cannot cover that package. release.yml
+          # calls create-avalonia-smoke.ps1 without -AvaloniaNativeVersion, and the smoke
+          # project's PackageReference for it is conditioned on that value, so MSBuild drops it
+          # without a word; no process built from it is ever launched here. Its characteristic
+          # failure - an inert macos_font_preinit.o - is text that never paints, not an error, so
+          # the zip-entry listing that pack-avalonia-native performs cannot see it either.
+          # avalonia-native.yml links the package, asserts the static link actually happened,
+          # smokes it per backend and then proves the smoke can fail. That is where it ships from.
+          # NOTE this means nuget.org needs a Trusted Publishing policy naming avalonia-native.yml;
+          # without one that workflow's push fails closed, which is the correct direction to fail.
+          pushed=0
+          skipped=""
+          for package in *.nupkg; do
+            case "$package" in
+              Optris.StaticGraphics.AvaloniaNative.*)
+                skipped="$skipped $package"
+                continue
+                ;;
+            esac
+            dotnet nuget push "$package" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+            pushed=$((pushed + 1))
+          done
+          if [ -n "$skipped" ]; then
+            echo "Not pushed from this workflow (published by avalonia-native.yml, which smokes it):$skipped"
+          fi
+          # A push loop that matched nothing would otherwise be indistinguishable from a
+          # successful release.
+          if [ "$pushed" -eq 0 ]; then
+            echo "::error::No tier package was pushed. artifacts/nuget held no Optris.StaticGraphics.Avalonia.<tier> package, so this run published nothing while reporting success."
+            exit 1
+          fi
           if compgen -G "*.snupkg" > /dev/null; then
-            dotnet nuget push "*.snupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+            for symbols in *.snupkg; do
+              case "$symbols" in
+                Optris.StaticGraphics.AvaloniaNative.*) continue ;;
+              esac
+              dotnet nuget push "$symbols" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
+            done
           fi
 
   release:

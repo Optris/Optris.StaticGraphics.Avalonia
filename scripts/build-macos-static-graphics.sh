@@ -283,6 +283,149 @@ assert_tier_symbols() {
   echo "Tier '$TIER' symbol contract verified in $library: backends $BACKENDS."
 }
 
+# Everything above is about Skia's own backend implementation - GrMtlGpu, GrGLGpu - which is
+# necessary and not sufficient. The defect this fork exists for lives one layer up, in SkiaSharp's
+# C API, and none of the checks above can see it: gr_direct_context_make_metal keeps its symbol and
+# returns nullptr when the backend was not compiled into that translation unit (SK_ONLY_METAL, in
+# src/c/sk_types_priv.h - the same mechanism as the SK_ONLY_VULKAN that started all this), so "the
+# entry point is defined" is precisely the evidence a stub produces too. Avalonia then creates a
+# device, hands it to Skia, gets nothing back, and the window opens, stays responsive, logs nothing
+# and never paints.
+#
+# What tells a wired entry point from a stub is what its own object file references:
+#     return SK_ONLY_METAL(ToGrDirectContext(GrDirectContext::MakeMetal(
+#         device, queue).release()), nullptr);
+# leaves a mangled reference carrying MakeMetal - and GrMtlBackendContext as well on the newer
+# GrDirectContexts::MakeMetal(const GrMtlBackendContext&) spelling - while the stub body is
+# `return nullptr` and references neither.
+#
+# Measured on the payload already in this tree rather than assumed, and Metal is what it was
+# measured on: in External/NativeStatic/static-Vulkan/win-x64/native/skia.lib, member
+# obj/src/c/skia.gr_context.obj defines gr_direct_context_make_metal - stubbed there, because Metal
+# is not built on Windows - with not one Metal name anywhere in that member, while
+# gr_direct_context_make_gl in the same object sits beside MakeGL and GrGLInterface. One archive,
+# one object file, opposite verdicts.
+#
+# Because the discriminator is per object file this takes its own nm pass with -A. The archive-wide
+# dump above cannot say which member a name came from, and GrDirectContext::MakeMetal is *defined*
+# elsewhere in libskia.a whether or not gr_context.cpp ever calls it - so an archive-wide grep
+# would answer a different question and answer it wrongly.
+#
+# Both payload archives are read. src/c compiles into the skia target today - that member is inside
+# skia.lib, and libSkiaSharp.a carries only src/xamarin - but that is SkiaSharp's layout, not a
+# contract we control. Searching both means a version that relocates the C API comes out as a loud
+# "cannot certify" here instead of an archive that ships with nobody having looked inside it.
+#
+#   backend : the entry point the managed side P/Invokes : names its real body must reference
+# The Vulkan tier is delivered by Metal here, as the header explains, so it is the Metal entry
+# point that has to be real.
+C_API_CONTRACT=(
+  "Vulkan:gr_direct_context_make_metal:MakeMetal|GrMtlBackendContext"
+  "OpenGL:gr_direct_context_make_gl:MakeGL|GrGLInterface"
+)
+
+# nm -A prefixes every symbol line with the archive and member it came from. GNU nm glues the
+# address straight onto that prefix, llvm-nm leaves a space, Apple's spells it archive(member): -
+# so the portable member key is the first column with its last colon-separated field dropped. A
+# first column with no colon in it means the reader ignored -A: there is then no member to key on,
+# and the caller has to say it cannot certify rather than produce a verdict. Mach-O prefixes C
+# symbols with an underscore, hence the second name. Every defining member is returned, not just
+# the first, so a second copy of the entry point cannot hide behind a good one.
+c_api_defining_members() {
+  local dump="$1" entry="$2"
+  awk -v want="$entry" '
+    NF >= 3 && ($NF == want || $NF == "_" want) {
+      type = $(NF - 1)
+      if (type == "U" || type == "u" || type == "w" || type == "v") next
+      key = $1
+      if (key !~ /:/) next
+      sub(/:[^:]*$/, "", key)
+      if (!seen[key]++) print key
+    }
+  ' "$dump"
+}
+
+c_api_member_references() {
+  local dump="$1" key="$2" tokens="$3"
+  local lines
+  # Not one pipeline, for the reason symbol_defined gives above: grep -q quits at its first match,
+  # the reader dies writing to the closed pipe, and pipefail turns that into "no match".
+  lines="$(grep -F -- "$key:" "$dump")" || return 1
+  grep -Eq -- "$tokens" <<<"$lines"
+}
+
+assert_c_api_entry_points() {
+  local applicable=() spec
+  for spec in "${C_API_CONTRACT[@]}"; do
+    if tier_claims "${spec%%:*}"; then
+      applicable+=("$spec")
+    fi
+  done
+  if [[ ${#applicable[@]} -eq 0 ]]; then
+    echo "Tier '$TIER' claims no GPU backend, so it has no C entry point to certify."
+    return 0
+  fi
+
+  local nm dump lib
+  nm="$(resolve_llvm_nm)"
+  dump="$(mktemp)"
+  for lib in "$@"; do
+    if ! "$nm" -A "$lib" >>"$dump" 2>/dev/null; then
+      rm -f "$dump"
+      echo "Symbol reader could not list $lib per member (nm -A)." >&2
+      echo "Without per-member output a wired entry point and a stub are indistinguishable, so" >&2
+      echo "this is a reader failure and not a verdict about the archive. Reader was: $nm" >&2
+      return 1
+    fi
+  done
+
+  local failures=() verified=() backend rest entry tokens members member wired
+  for spec in "${applicable[@]}"; do
+    backend="${spec%%:*}"
+    rest="${spec#*:}"
+    entry="${rest%%:*}"
+    tokens="${rest#*:}"
+
+    members="$(c_api_defining_members "$dump" "$entry")"
+    if [ -z "$members" ]; then
+      rm -f "$dump"
+      echo "Cannot certify the $backend backend of tier '$TIER': nothing in the payload came back" >&2
+      echo "as a definition of $entry, the entry point the managed side P/Invokes. Either no" >&2
+      echo "archive defines it, or the reader ignored -A and there is no member to attribute it to." >&2
+      echo "Either way this is 'could not check' and not 'checked and fine', and must not be" >&2
+      echo "reported as the latter. Archives read: $*" >&2
+      echo "If a SkiaSharp version moved src/c into another target, add that archive here - do" >&2
+      echo "not drop the check." >&2
+      return 1
+    fi
+
+    wired=1
+    while IFS= read -r member; do
+      [ -n "$member" ] || continue
+      if ! c_api_member_references "$dump" "$member" "$tokens"; then
+        failures+=("tier '$TIER' claims $backend but $entry is a stub - its object ($member) references none of ${tokens//|/, }")
+        wired=0
+      fi
+    done <<<"$members"
+
+    if [[ "$wired" -eq 1 ]]; then
+      verified+=("$entry")
+    fi
+  done
+  rm -f "$dump"
+
+  if [[ ${#failures[@]} -gt 0 ]]; then
+    echo "C API entry points contradict tier '$TIER' (backends $BACKENDS):" >&2
+    printf '  %s\n' "${failures[@]}" >&2
+    echo "A stub keeps its symbol and returns nullptr, which is exactly how a package comes to" >&2
+    echo "advertise a backend and paint nothing. Get the backend's macro into SkiaSharp's C compile," >&2
+    echo "or stop claiming the backend - do not relax this." >&2
+    return 1
+  fi
+
+  echo "C API entry points wired, not stubbed, for tier '$TIER': ${verified[*]}."
+}
+
 sync_skiasharp() {
   local src="$WORK_DIR/SkiaSharp-$SKIASHARP_VERSION"
   if [[ ! -d "$src/.git" ]]; then
@@ -418,6 +561,7 @@ EOF_ARGS
   copy_first_existing "$OUTPUT_DIR/libHarfBuzzSharp.a" "$out_dir/libHarfBuzzSharp.a" "$out_dir/obj/libHarfBuzzSharp.a"
 
   assert_tier_symbols "$OUTPUT_DIR/libskia.a"
+  assert_c_api_entry_points "$OUTPUT_DIR/libskia.a" "$OUTPUT_DIR/libSkiaSharp.a"
 }
 
 main() {

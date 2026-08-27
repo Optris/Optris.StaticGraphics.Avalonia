@@ -9,8 +9,22 @@ inputs:
     description: Path to the .nupkg
     required: true
   angle_branch:
-    description: Chromium branch the ANGLE archives came from
+    description: >-
+      Chromium branch the props file is expected to declare. Every caller reads this from the same
+      OptrisStaticGraphicsAngleBranch property that dotnet pack uses to write that line, so on its
+      own this is a self-check: it catches a props-generation bug and says nothing whatsoever about
+      the archives in the package. Pass angle_branch_evidence to turn it into a real cross-check.
     required: true
+  angle_branch_evidence:
+    description: >-
+      Path to a record written by whatever actually produced the ANGLE archives in this package,
+      naming the branch they came from - for a repack, the buildTransitive props of the published
+      package the payload was lifted out of. Either XML declaring OptrisStaticGraphicsAngleBranch,
+      or a file holding the bare branch number. Given one, the branch the package advertises is
+      compared against it and a mismatch fails the step; left empty, the branch is reported as
+      unverified instead of quietly passing.
+    required: false
+    default: ""
   include_macos:
     description: >-
       Whether the osx RIDs are expected in this package. Must track verify-tier-payload's input of
@@ -28,17 +42,20 @@ runs:
         TIER: ${{ inputs.tier }}
         PACKAGE: ${{ inputs.package }}
         ANGLE_BRANCH: ${{ inputs.angle_branch }}
+        ANGLE_BRANCH_EVIDENCE: ${{ inputs.angle_branch_evidence }}
         INCLUDE_MACOS: ${{ inputs.include_macos }}
       run: |
         python3 - <<'PY'
         import os
         import pathlib
+        import re
         import sys
         import xml.etree.ElementTree as ET
         import zipfile
 
         tier = os.environ["TIER"]
         angle_branch = os.environ["ANGLE_BRANCH"]
+        angle_evidence = os.environ.get("ANGLE_BRANCH_EVIDENCE", "").strip()
         package_id = f"Optris.StaticGraphics.Avalonia.{tier}"
         expected_backends = {
             "Vulkan": {"Vulkan", "OpenGL", "Software"},
@@ -52,7 +69,24 @@ runs:
         if not path.name.startswith(f"{package_id}."):
             sys.exit(f"::error::{path.name} is not a {package_id} package")
 
+        def recorded_angle_branch(record):
+            """The branch whoever built the archives wrote down, read from a file this pack step did
+            not generate: XML declaring OptrisStaticGraphicsAngleBranch, or the bare number."""
+            data = record.read_bytes()
+            try:
+                root = ET.fromstring(data)
+            except ET.ParseError:
+                return data.decode("utf-8", "replace").strip()
+            declarations = [
+                (element.text or "").strip()
+                for element in root.iter()
+                if element.tag.split("}")[-1] == "OptrisStaticGraphicsAngleBranch"
+            ]
+            return next((value for value in declarations if value), "")
+
         failures = []
+        declared_branch = ""
+        provenance = ""
         with zipfile.ZipFile(path) as archive:
             names = archive.namelist()
             if any("\\" in name for name in names):
@@ -85,6 +119,49 @@ runs:
                         failures.append(f"{props} does not publish {key}")
                     elif declared[key].lower() != expected.lower():
                         failures.append(f"{props}: {key} is {declared[key]!r}, expected {expected!r}")
+
+                # Whether the branch this package advertises is the branch its archives were built
+                # from is the one thing the loop above cannot tell you. angle_branch reaches us from
+                # the same OptrisStaticGraphicsAngleBranch property dotnet pack used to write the
+                # props line (csproj:34 -> csproj:36 -> csproj:124), so that comparison is a value
+                # against its own origin: teeth against a props-generation bug, none against
+                # provenance. Repack is where the two come apart - it lifts the payload out of an
+                # already published package and repacks it under today's props, so a payload built
+                # at chromium/7258 gets republished advertising 7922, and nothing in the archives,
+                # the entry names or the payload contradicts it. So either an independent record is
+                # supplied and compared, or the branch is called out below as unverified. It is
+                # never reported as checked.
+                declared_branch = declared.get("OptrisStaticGraphicsAngleBranch")
+                if tier != "Software" and declared_branch is not None:
+                    if not re.fullmatch(r"\d+", declared_branch):
+                        failures.append(
+                            f"{props}: OptrisStaticGraphicsAngleBranch is {declared_branch!r}, not a "
+                            "chromium branch number - a tier that ships ANGLE has to name the branch "
+                            "it came from, and two empty strings compare equal"
+                        )
+                    elif angle_evidence:
+                        record = pathlib.Path(angle_evidence)
+                        if not record.is_file():
+                            failures.append(
+                                f"angle_branch_evidence {record} does not exist, so the branch the "
+                                "shipped ANGLE archives were built from cannot be read and no claim "
+                                "about it can be verified"
+                            )
+                        else:
+                            recorded = recorded_angle_branch(record)
+                            if not re.fullmatch(r"\d+", recorded):
+                                failures.append(
+                                    f"angle_branch_evidence {record} records no chromium branch "
+                                    f"(read {recorded!r}), so ANGLE provenance cannot be verified"
+                                )
+                            elif recorded != declared_branch:
+                                failures.append(
+                                    f"{props}: package advertises ANGLE chromium/{declared_branch}, "
+                                    f"but {record} records the archives it ships as chromium/{recorded}"
+                                )
+                            else:
+                                provenance = f"{record} (chromium/{recorded})"
+
                 backends = declared.get("OptrisStaticGraphicsBackends")
                 if backends is None:
                     failures.append(f"{props} does not publish OptrisStaticGraphicsBackends")
@@ -116,5 +193,23 @@ runs:
 
         if failures:
             sys.exit("::error::" + "\n".join(failures))
-        print(f"{path.name} satisfies the {tier} contract.")
+        if tier == "Software":
+            print(f"{path.name} satisfies the {tier} contract.")
+        elif provenance:
+            print(f"{path.name} satisfies the {tier} contract, ANGLE branch cross-checked against {provenance}.")
+        else:
+            # Name the half of the verdict that is missing. "I checked and it is fine" and "I could
+            # not check" have to read differently in the log, or the next person takes the green
+            # tick for a statement about the archives - which is the mistake this whole repository
+            # exists to stop making.
+            print(
+                f"::warning::{path.name}: ANGLE branch NOT verified. The package advertises "
+                f"chromium/{declared_branch}, and with no angle_branch_evidence given that value was "
+                "only compared with the property that generated it. Nothing here read the archives, "
+                "and nothing in them records a branch."
+            )
+            print(
+                f"{path.name} satisfies the {tier} contract, except the ANGLE branch: "
+                f"chromium/{declared_branch} is unverified, not confirmed."
+            )
         PY

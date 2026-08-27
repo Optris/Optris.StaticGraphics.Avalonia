@@ -3,6 +3,17 @@ name: ♻️ Repack
 # The MSBuild props and targets carry the consumer contract (OSG0001, OSG0002, the published
 # OptrisStaticGraphics* properties). Fixing those must not cost a full native rebuild, so this
 # lifts the static payload out of a package we already shipped and repacks it.
+#
+# Skipping the native builds is the point. Skipping the proof was not: this workflow edits exactly
+# the files that decide what a consumer links and what the package claims to be, and it used to
+# push to nuget.org having run neither the consumer guard nor a single rendered frame - strictly
+# weaker evidence than release.yml demands for the same package id. So the guard and the smoke
+# matrix run here too, and the push is gated on both.
+#
+# It also refuses to relabel. A repack cannot rebuild an archive, so the SkiaSharp release and the
+# chromium branch the payload was built from are read out of the package it was lifted from and
+# checked against what this run is about to publish. Only the fourth version part - the fork build
+# revision - is a repack's to change.
 
 on:
   workflow_dispatch:
@@ -21,11 +32,21 @@ on:
         required: false
         default: '["Vulkan","OpenGL","Software"]'
         type: string
+      include_macos:
+        description: The source package ships the osx RIDs (asserted against what it actually contains)
+        required: false
+        default: true
+        type: boolean
       publish_to_nuget:
-        description: Push to nuget.org
+        description: Push to nuget.org, after the consumer guard and the smoke tests
         required: false
         default: false
         type: boolean
+
+env:
+  DOTNET_VERSION: "10.0.302"
+  DOTNET_ALPINE_IMAGE: mcr.microsoft.com/dotnet/sdk:10.0.302-alpine3.23
+  AVALONIA_SMOKE_VERSION: "11.3.14"
 
 jobs:
   repack:
@@ -47,7 +68,76 @@ jobs:
       - name: 🟣 Setup .NET
         uses: actions/setup-dotnet@v5
         with:
-          dotnet-version: "10.0.302"
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 🔢 Validate the requested versions
+        shell: bash
+        env:
+          PUBLISH_TO_NUGET: ${{ inputs.publish_to_nuget }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.request
+
+          tier = os.environ["TIER"]
+          source = os.environ["SOURCE_VERSION"]
+          target = os.environ["TARGET_VERSION"]
+          publishing = os.environ.get("PUBLISH_TO_NUGET") == "true"
+          package_id = f"Optris.StaticGraphics.Avalonia.{tier}"
+
+          # Pack splits target_version with ${VERSION%.*} and hands the halves to
+          # -p:SkiaSharpVersion and -p:BuildRev, which become the package identity and a real
+          # <dependency id="SkiaSharp"> line. release.yml gets those numbers from preflight, which
+          # regex-checks both halves and refuses a tag that disagrees with them. A dispatch of this
+          # workflow checked nothing, so any string at all became a version somebody would then
+          # have to ask nuget.org to unlist.
+          for name, value in (("source_version", source), ("target_version", target)):
+              if not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", value):
+                  sys.exit(
+                      f"::error::{name} must be four numeric parts - a three-part SkiaSharp version "
+                      f"plus the fork build revision - got {value!r}"
+                  )
+
+          if not publishing:
+              print(f"{package_id}: repacking {source} as {target}. No push requested.")
+              raise SystemExit(0)
+
+          # Versions on nuget.org are immutable, so repacking one that is already public cannot
+          # change what anybody downloads - and the push below runs --skip-duplicate, which exits 0
+          # having uploaded nothing. That pair is a green run whose consumers keep the old bits,
+          # the same shape release.yml's AvaloniaNative revision guard exists to refuse. Retrying a
+          # run where one tier published and another failed is a re-dispatch with `tiers` narrowed
+          # to the ones still missing, not a push that quietly does nothing.
+          url = f"https://api.nuget.org/v3-flatcontainer/{package_id.lower()}/index.json"
+          try:
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  versions = json.load(response).get("versions", [])
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  sys.exit(
+                      f"::error::nuget.org returned HTTP {error.code} for {package_id}; cannot tell "
+                      f"whether {target} is already public, and this run intends to push."
+                  )
+              versions = []
+          except Exception as error:  # noqa: BLE001 - any transport failure is equally undecidable
+              sys.exit(
+                  f"::error::Could not reach nuget.org for {package_id} ({error}); cannot tell "
+                  f"whether {target} is already public, and this run intends to push."
+              )
+
+          if target in versions:
+              sys.exit(
+                  f"::error::{package_id} {target} is already on nuget.org, and versions there are "
+                  "immutable. The push runs with --skip-duplicate, so this run would report success "
+                  "having published nothing at all. Raise the build revision in target_version, or "
+                  "re-dispatch with `tiers` narrowed to the tiers that are still unpublished."
+              )
+          print(f"{package_id} {target} is unpublished. Repacking it from {source}.")
+          PY
 
       - name: 🔢 Read the pinned ANGLE branch
         id: angle
@@ -59,14 +149,17 @@ jobs:
           [ -n "$branch" ] || { echo "::error::OptrisStaticGraphicsAngleBranch is not set"; exit 1; }
           echo "branch=$branch" >> "$GITHUB_OUTPUT"
 
-      - name: 📥 Extract static libraries from the published package
+      - name: 📥 Extract the static payload, and keep what it was built from
+        id: payload
         shell: bash
         run: |
           python3 - <<'PY'
           import os
           import pathlib
+          import re
           import sys
           import urllib.request
+          import xml.etree.ElementTree as ET
           import zipfile
 
           tier = os.environ["TIER"]
@@ -83,9 +176,83 @@ jobs:
           except Exception as error:  # noqa: BLE001
               sys.exit(f"::error::Could not download {package_id} {version}: {error}")
 
+          # The pack step is about to overwrite every claim this package makes about its own payload
+          # with values from today's checkout. Provenance that cannot be READ is not a smaller
+          # problem than provenance that disagrees - it means nothing downstream can be checked at
+          # all - so every branch below stops the run instead of lowering itself to a warning.
+          def fail(message):
+              sys.exit(f"::error::{message}")
+
           output = pathlib.Path("External/NativeStatic") / f"static-{tier}"
+          record = pathlib.Path("artifacts/source-provenance")
+          record.mkdir(parents=True, exist_ok=True)
+          props_entry = f"buildTransitive/{package_id}.props"
+          # Both verifiers assert only about the RIDs they are handed, and the packaging project
+          # globs a fixed list. Anything else in here would be extracted, possibly packed, and
+          # checked by nobody.
+          known_rids = {
+              "win-x64", "win-x86", "win-arm64",
+              "linux-x64", "linux-arm64", "linux-musl-x64", "linux-musl-arm64",
+              "osx-x64", "osx-arm64",
+          }
           extracted = 0
+          rids = set()
+
           with zipfile.ZipFile(package) as archive:
+              names = archive.namelist()
+
+              # The published props is the only witness left to how these archives were built: it
+              # was written at pack time from the branch that produced the ANGLE sitting beside it.
+              # This loop used to keep "/native/" entries only, so that file - the one thing in the
+              # download able to contradict the repack - went in the bin, and the branch the new
+              # package advertises was then "verified" against the csproj that had just generated
+              # it. Keeping it is what turns that self-check into a real comparison.
+              if props_entry not in names:
+                  fail(
+                      f"{package_id} {version} carries no {props_entry}, so nothing in it records "
+                      "the SkiaSharp release or the chromium branch its archives were built from. "
+                      "Refusing to repack a payload whose provenance cannot be read - build this "
+                      "version with release.yml instead."
+                  )
+              source_props = record / f"{package_id}.props"
+              source_props.write_bytes(archive.read(props_entry))
+              try:
+                  declared = {
+                      element.tag.split("}")[-1]: (element.text or "").strip()
+                      for element in ET.fromstring(source_props.read_bytes()).iter()
+                  }
+              except ET.ParseError as error:
+                  fail(f"{props_entry} in {package_id} {version} is not parseable XML ({error})")
+
+              # The nuspec dependency is the managed SkiaSharp these native archives were compiled
+              # to match. It is written by the same pack that produced them, and it is the number
+              # this run is at liberty to contradict.
+              nuspecs = [name for name in names if "/" not in name and name.lower().endswith(".nuspec")]
+              if len(nuspecs) != 1:
+                  fail(
+                      f"{package_id} {version} has {len(nuspecs)} .nuspec entries at its root "
+                      f"({nuspecs}), so the SkiaSharp release its archives pair with cannot be read"
+                  )
+              try:
+                  nuspec = ET.fromstring(archive.read(nuspecs[0]))
+              except ET.ParseError as error:
+                  fail(f"{nuspecs[0]} in {package_id} {version} is not parseable XML ({error})")
+              dependencies = [
+                  (element.get("version") or "").strip()
+                  for element in nuspec.iter()
+                  if element.tag.split("}")[-1] == "dependency"
+                  and (element.get("id") or "").lower() == "skiasharp"
+              ]
+              found = {match.group(0) for match in
+                       (re.search(r"\d+\.\d+\.\d+", value) for value in dependencies) if match}
+              if len(found) != 1:
+                  fail(
+                      f"{nuspecs[0]} declares SkiaSharp dependencies {dependencies or '[]'}, from "
+                      "which no single SkiaSharp release can be read - so there is nothing to check "
+                      "the version this run would publish against"
+                  )
+              source_skiasharp = found.pop()
+
               for entry in archive.infolist():
                   name = entry.filename.replace("\\", "/")
                   if entry.is_dir() or "/native/" not in name:
@@ -95,19 +262,88 @@ jobs:
                   index = parts.index("native")
                   if index < 1:
                       continue
+                  rids.add(parts[index - 1])
                   destination = output.joinpath(*parts[index - 1:])
                   destination.parent.mkdir(parents=True, exist_ok=True)
                   destination.write_bytes(archive.read(entry))
                   extracted += 1
+
           if not extracted:
-              sys.exit(f"::error::{package_id} {version} contained no static payload")
+              fail(f"{package_id} {version} contained no static payload")
+
+          unknown = sorted(rids - known_rids)
+          if unknown:
+              fail(
+                  f"{package_id} {version} carries RIDs neither verifier knows about: {unknown}. "
+                  "Every assertion in both of them iterates a hard-coded RID list, so these would "
+                  "travel into the new package with no symbol scan and no ANGLE check while both "
+                  "steps printed success."
+              )
+
+          recorded_version = declared.get("OptrisStaticGraphicsPackageVersion", "")
+          if recorded_version != version:
+              fail(
+                  f"{package_id} {version} was requested, but the props inside the file that came "
+                  f"back records itself as {recorded_version or 'nothing'}. The download is "
+                  "unpinned - no hash, no signature - so the version in the URL is the only claim "
+                  "about those bytes and this is the only thing inside them that can second it."
+              )
+
+          include_macos = "true" if rids & {"osx-x64", "osx-arm64"} else "false"
+          angle_branch = declared.get("OptrisStaticGraphicsAngleBranch", "")
           print(f"Extracted {extracted} files into {output}")
+          print(f"  RIDs           : {' '.join(sorted(rids))}")
+          print(f"  built against  : SkiaSharp {source_skiasharp}")
+          print(f"  ANGLE branch   : {angle_branch or 'none (tier ships no ANGLE)'}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"skiasharp_version={source_skiasharp}\n")
+              handle.write(f"angle_branch={angle_branch}\n")
+              handle.write(f"include_macos={include_macos}\n")
+              handle.write(f"rids={' '.join(sorted(rids))}\n")
+              handle.write(f"props={source_props.as_posix()}\n")
           PY
+
+      - name: 🧬 Refuse to publish the payload as something it is not
+        shell: bash
+        env:
+          SOURCE_SKIASHARP: ${{ steps.payload.outputs.skiasharp_version }}
+          PAYLOAD_RIDS: ${{ steps.payload.outputs.rids }}
+          PAYLOAD_INCLUDE_MACOS: ${{ steps.payload.outputs.include_macos }}
+          INCLUDE_MACOS: ${{ inputs.include_macos }}
+        run: |
+          set -euo pipefail
+          target_skiasharp="${TARGET_VERSION%.*}"
+
+          # Nothing in this workflow rebuilds an archive, and no check downstream has a version
+          # concept: verify-tier-payload's probes are present in every recent Skia, so archives for
+          # 4.150.1 verify identically to archives for 4.151.0. Repacking under a different first
+          # three parts therefore publishes a package whose identity, description and
+          # <dependency id="SkiaSharp"> all describe a build that never happened, and the consumer
+          # gets managed SkiaSharp X statically linked against native Y.
+          if [ "$target_skiasharp" != "$SOURCE_SKIASHARP" ]; then
+            echo "::error::target_version $TARGET_VERSION would publish SkiaSharp $target_skiasharp, but the archives lifted from $SOURCE_VERSION were built against SkiaSharp $SOURCE_SKIASHARP. A repack may change the fourth version part - the fork build revision - and nothing else. Use release.yml to ship a new SkiaSharp version."
+            exit 1
+          fi
+
+          # The osx RIDs are the ones neither verifier looks at unless it is told to, while the
+          # packaging project globs osx-x64 and osx-arm64 in unconditionally. Left disagreeing,
+          # those two archives ship with no symbol scan and no ANGLE-absence check while both
+          # verify steps print their success line - the empty-input vacuous pass. The value below
+          # is read from the payload itself; the input exists because the smoke matrix has to be
+          # decided before any job has seen the package.
+          if [ "$PAYLOAD_INCLUDE_MACOS" != "$INCLUDE_MACOS" ]; then
+            echo "::error::include_macos is $INCLUDE_MACOS, but $SOURCE_VERSION ships RIDs: $PAYLOAD_RIDS (osx archives present: $PAYLOAD_INCLUDE_MACOS). Re-dispatch with include_macos: $PAYLOAD_INCLUDE_MACOS - that also decides which RIDs the smoke matrix proves."
+            exit 1
+          fi
+
+          echo "Payload from $SOURCE_VERSION: SkiaSharp $SOURCE_SKIASHARP, RIDs $PAYLOAD_RIDS."
+          echo "Publishing it as $TARGET_VERSION changes the build revision only."
 
       - name: ✅ Verify tier payload
         uses: ./.github/actions/verify-tier-payload
         with:
           tier: ${{ matrix.tier }}
+          include_macos: ${{ steps.payload.outputs.include_macos }}
 
       - name: 📦 Pack
         shell: bash
@@ -130,6 +366,14 @@ jobs:
           tier: ${{ matrix.tier }}
           package: artifacts/nuget/Optris.StaticGraphics.Avalonia.${{ matrix.tier }}.${{ inputs.target_version || inputs.source_version }}.nupkg
           angle_branch: ${{ steps.angle.outputs.branch }}
+          # angle_branch above is read from the same property dotnet pack used to write the props
+          # line, so on its own it is a value compared with its own origin. The archives in this
+          # package were built by a release run months ago; the props of the package they came out
+          # of is the only record of the branch they came from, so it is handed over as evidence.
+          # A run after OptrisStaticGraphicsAngleBranch was bumped in the packaging project now
+          # fails here, and that is the correct outcome: a new branch needs a new ANGLE build.
+          angle_branch_evidence: ${{ steps.payload.outputs.props }}
+          include_macos: ${{ steps.payload.outputs.include_macos }}
 
       - name: 📤 Upload NuGet package
         uses: actions/upload-artifact@v7
@@ -140,17 +384,468 @@ jobs:
             artifacts/nuget/*.snupkg
           if-no-files-found: error
 
-      # Trusted Publishing, same as release.yml - no stored key. See the note there: policies are
-      # per workflow file, so publishing from repack.yml needs its own policy naming repack.yml.
+  verify-consumer-guard:
+    name: 🛡️ Consumer guard
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    needs: repack
+    # This workflow exists to edit the file this job is the only behavioural test of. Nothing else
+    # reads a byte of the targets: verify-tier-package asserts that buildTransitive/<id>.targets is
+    # PRESENT and never opens it, and every NativeLibrary and DirectPInvoke inside it is gated on
+    # Exists(), so a mistyped path drops the item in silence and the publish step then deletes the
+    # dynamic libraries the app just fell back to. Repack used to push without this job.
+    env:
+      PACKAGE_VERSION: ${{ inputs.target_version || inputs.source_version }}
+      TIERS: ${{ inputs.tiers }}
+    steps:
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 📥 Download the repacked packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: repacked-nuget-*
+          path: artifacts/nuget
+          merge-multiple: true
+
+      - name: 🛡️ Assert OSG0001 fires on a missing backend
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          version = os.environ["PACKAGE_VERSION"]
+          tiers = json.loads(os.environ["TIERS"])
+          backends = {"Vulkan": ["Vulkan", "OpenGL", "Software"], "OpenGL": ["OpenGL", "Software"], "Software": ["Software"]}
+          feed = pathlib.Path("artifacts/nuget").resolve()
+          failures = []
+
+          def build(tier, required, acknowledge):
+              directory = pathlib.Path(f"probe/{tier}-{'-'.join(required) or 'none'}")
+              directory.mkdir(parents=True, exist_ok=True)
+              (directory / "NuGet.config").write_text(
+                  '<?xml version="1.0" encoding="utf-8"?>\n'
+                  "<configuration><packageSources><clear />"
+                  f'<add key="local" value="{feed.as_posix()}" />'
+                  '<add key="nuget" value="https://api.nuget.org/v3/index.json" />'
+                  "</packageSources></configuration>\n",
+                  encoding="utf-8",
+              )
+              (directory / "Probe.csproj").write_text(
+                  "<Project Sdk=\"Microsoft.NET.Sdk\">\n"
+                  "  <PropertyGroup>\n"
+                  "    <TargetFramework>net10.0</TargetFramework>\n"
+                  "    <OutputType>Exe</OutputType>\n"
+                  "    <RuntimeIdentifier>linux-x64</RuntimeIdentifier>\n"
+                  f"    <OptrisStaticGraphicsRequiredBackends>{';'.join(required)}</OptrisStaticGraphicsRequiredBackends>\n"
+                  + (f"    <OptrisStaticGraphicsAcknowledgeReducedTier>true</OptrisStaticGraphicsAcknowledgeReducedTier>\n" if acknowledge else "")
+                  + "  </PropertyGroup>\n"
+                  "  <ItemGroup>\n"
+                  f"    <PackageReference Include=\"Optris.StaticGraphics.Avalonia.{tier}\" Version=\"{version}\" />\n"
+                  "  </ItemGroup>\n"
+                  "</Project>\n",
+                  encoding="utf-8",
+              )
+              (directory / "Program.cs").write_text("System.Console.WriteLine();\n", encoding="utf-8")
+              result = subprocess.run(
+                  ["dotnet", "build", str(directory / "Probe.csproj"), "-c", "Release"],
+                  capture_output=True, text=True,
+              )
+              return result.returncode, result.stdout + result.stderr
+
+          # Counted, for the reason release.yml records: the positive probe builds fine whether or
+          # not OSG0001 still exists, and both checks that can actually catch a broken guard sit
+          # under `if missing:`, which is empty for the Vulkan tier. A Vulkan-only run would
+          # otherwise print "behaves as specified" having watched nothing fire.
+          negative_controls = 0
+
+          for tier in tiers:
+              code, log = build(tier, backends[tier], acknowledge=True)
+              if code != 0:
+                  failures.append(f"{tier}: a project requiring exactly {backends[tier]} failed to build:\n{log[-4000:]}")
+              missing = [name for name in ("Vulkan", "OpenGL") if name not in backends[tier]]
+              if missing:
+                  negative_controls += 1
+                  code, log = build(tier, [missing[0]], acknowledge=True)
+                  if code == 0:
+                      failures.append(f"{tier}: requiring {missing[0]} built successfully; OSG0001 never fired")
+                  elif "OSG0001" not in log:
+                      failures.append(f"{tier}: requiring {missing[0]} failed without OSG0001:\n{log[-4000:]}")
+                  code, log = build(tier, [], acknowledge=False)
+                  if "OSG0002" not in log:
+                      failures.append(f"{tier}: reduced tier used without acknowledgement did not warn OSG0002")
+
+          if negative_controls == 0:
+              failures.append(
+                  f"no negative control ran. Every tier in {tiers} carries all backends, so neither "
+                  "OSG0001 (requiring an absent backend must FAIL the build) nor OSG0002 (an "
+                  "unacknowledged reduced tier must WARN) was ever exercised, and a regression in "
+                  "either would have passed unseen. Repack a reduced tier - OpenGL or Software - "
+                  "alongside it, or this job cannot claim the guard works."
+              )
+
+          if failures:
+              sys.exit("::error::" + "\n\n".join(failures))
+          print(
+              f"Consumer guard behaves as specified: {negative_controls} negative control(s) "
+              f"observed across tiers {tiers}."
+          )
+          PY
+
+  smoke:
+    name: 🔥 Smoke ${{ matrix.tier }} ${{ matrix.rid }}
+    needs: repack
+    # The only step in this repository that renders a frame and reads the pixels back. A repack
+    # rebuilds no archive, so the multi-hour native jobs stay skipped - but the link inputs, the
+    # DirectPInvoke names and the published tier properties all come from files this run rewrote,
+    # and a package that passes every structural check and still draws nothing is the defect this
+    # fork exists for. The steps are release.yml's smoke job, changed only where the artifact name
+    # and the version come from: same RIDs, same script, same negative control. Publishing on
+    # weaker evidence than release demands for the same package id is what this job undoes, so if
+    # that job gains a check, this one needs it too.
+    strategy:
+      fail-fast: false
+      matrix:
+        tier: ${{ fromJSON(inputs.tiers) }}
+        # rid and include are BOTH switched together, and there is no `exclude` here on purpose:
+        # GitHub processes include AFTER exclude and documents it as a way to add combinations back,
+        # so an excluded rid that still appears in include returns - without a tier, because include
+        # supplies none. release.yml carries the full story; the shape is copied from it.
+        rid: ${{ fromJSON(inputs.include_macos && '["win-x64","win-x86","win-arm64","linux-x64","linux-arm64","linux-musl-x64","linux-musl-arm64","osx-x64","osx-arm64"]' || '["win-x64","win-x86","win-arm64","linux-x64","linux-arm64","linux-musl-x64","linux-musl-arm64"]') }}
+        include: ${{ fromJSON(inputs.include_macos && '[{"rid":"win-x64","runner":"windows-2022","msvc_arch":"x64"},{"rid":"win-x86","runner":"windows-2022","msvc_arch":"x86"},{"rid":"win-arm64","runner":"windows-11-arm","msvc_arch":"arm64"},{"rid":"linux-x64","runner":"ubuntu-24.04"},{"rid":"linux-arm64","runner":"ubuntu-24.04-arm"},{"rid":"linux-musl-x64","runner":"ubuntu-24.04"},{"rid":"linux-musl-arm64","runner":"ubuntu-24.04-arm"},{"rid":"osx-x64","runner":"macos-15"},{"rid":"osx-arm64","runner":"macos-15"}]' || '[{"rid":"win-x64","runner":"windows-2022","msvc_arch":"x64"},{"rid":"win-x86","runner":"windows-2022","msvc_arch":"x86"},{"rid":"win-arm64","runner":"windows-11-arm","msvc_arch":"arm64"},{"rid":"linux-x64","runner":"ubuntu-24.04"},{"rid":"linux-arm64","runner":"ubuntu-24.04-arm"},{"rid":"linux-musl-x64","runner":"ubuntu-24.04"},{"rid":"linux-musl-arm64","runner":"ubuntu-24.04-arm"}]') }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      TIER: ${{ matrix.tier }}
+      RID: ${{ matrix.rid }}
+      PACKAGE_VERSION: ${{ inputs.target_version || inputs.source_version }}
+    steps:
+      - name: 🛒 Checkout
+        uses: actions/checkout@v6
+
+      - name: 🧰 Setup MSVC environment
+        if: ${{ startsWith(matrix.rid, 'win-') }}
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.msvc_arch }}
+
+      - name: 🧰 Install Linux publish and run dependencies
+        if: ${{ startsWith(matrix.rid, 'linux-') && !startsWith(matrix.rid, 'linux-musl-') }}
+        run: |
+          sudo apt-get update
+          # mesa-vulkan-drivers is lavapipe, a software Vulkan ICD. The runner has no GPU and the
+          # failure under test does not need one: Avalonia hands Skia a real VkDevice either way, and
+          # a Skia built without Vulkan still answers with a null GRContext.
+          sudo apt-get install -y clang lld xvfb zlib1g-dev libfontconfig1-dev libfreetype6 fonts-dejavu-core \
+            libgl1 libgl1-mesa-dri libegl1 libvulkan1 mesa-vulkan-drivers \
+            libice6 libsm6 libx11-6 libxcb1 libxcursor1 libxext6 libxfixes3 libxinerama1 libxrandr2 libxrender1 libxi6
+
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 📥 Download the repacked packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: repacked-nuget-*
+          path: artifacts/nuget
+          merge-multiple: true
+
+      - name: 🧭 What this tier has to be proven with
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Each tier is a strict superset of the one below it, so a tier is only proven once every
+          # backend it promises has drawn the picture. Asking for a backend a tier does not carry is
+          # exit 3 from the app rather than a failure, so the list is derived and never guessed.
+          case "$TIER" in
+            Vulkan)   backends="Vulkan OpenGL Software" ;;
+            OpenGL)   backends="OpenGL Software" ;;
+            Software) backends="Software" ;;
+            *) echo "::error::Unknown tier '$TIER'."; exit 1 ;;
+          esac
+
+          # Avalonia has no Vulkan backend on macOS, and the app refuses such a run with exit 3 rather
+          # than accepting Metal in its place; a Vulkan tier is proven there by its other two backends.
+          # win-arm64 drops Vulkan for a different reason: lavapipe publishes no arm64 Windows build,
+          # so there is no software ICD to render with. Those are the only two backends anywhere here
+          # that no run exercises, and they are named rather than skipped.
+          case "$RID" in
+            osx-*|win-arm64) backends="$(printf '%s\n' $backends | grep -vx Vulkan | tr '\n' ' ' || true)" ;;
+          esac
+
+          # GLX needs an X server offering the extension AND a GL implementation behind it. A bare
+          # `xvfb-run -a` gave neither: every Linux OpenGL leg failed with "RenderingMode has a value
+          # of Glx, but no options were applied", Avalonia's way of saying the mode never initialised.
+          launcher=""
+          case "$RID" in
+            linux-*)
+              launcher="xvfb-run -a --server-args=-screen 0 1280x1024x24 +extension GLX +extension RANDR +render -noreset"
+              ;;
+          esac
+
+          {
+            echo "SMOKE_TIER=$TIER"
+            echo "SMOKE_BACKENDS=$(echo $backends)"
+            echo "SMOKE_LABEL=$TIER on $RID"
+            echo "SMOKE_DIR=artifacts/smoke-$TIER-$RID"
+            echo "SMOKE_LOG_DIR=artifacts/smoke-logs/$TIER-$RID"
+            echo "SMOKE_LAUNCHER=$launcher"
+          } >> "$GITHUB_ENV"
+
+          # Force Mesa's software GL for the Linux legs: an unconfigured libGL looks for a hardware
+          # driver, finds none, and takes the OpenGL backend of every Linux tier down with it.
+          case "$RID" in
+            linux-*)
+              {
+                echo "LIBGL_ALWAYS_SOFTWARE=1"
+                echo "GALLIUM_DRIVER=llvmpipe"
+              } >> "$GITHUB_ENV"
+              ;;
+          esac
+          echo "$TIER on $RID will be proven with: $backends"
+
+      - name: 🔥 Publish single-file smoke app
+        if: ${{ !startsWith(matrix.rid, 'linux-musl-') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $projectDir = Join-Path $PWD "artifacts/avalonia-smoke-src"
+          pwsh ./scripts/create-avalonia-smoke.ps1 `
+            -ProjectDir $projectDir `
+            -NuGetSource (Resolve-Path "artifacts/nuget") `
+            -Tier "$env:TIER" `
+            -PackageVersion "$env:PACKAGE_VERSION" `
+            -AvaloniaVersion "$env:AVALONIA_SMOKE_VERSION"
+          dotnet publish (Join-Path $projectDir "OptrisStaticGraphicsSmoke.csproj") `
+            -c Release `
+            -r "$env:RID" `
+            --configfile (Join-Path $projectDir "NuGet.config") `
+            /p:PublishAot=true `
+            /p:SelfContained=true `
+            /p:PublishSingleFile=true `
+            /p:StripSymbols=true `
+            /p:PublishDir="$PWD/artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/"
+
+      - name: 🔥 Publish musl smoke app
+        if: ${{ startsWith(matrix.rid, 'linux-musl-') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $projectDir = Join-Path $PWD "artifacts/avalonia-smoke-src"
+          pwsh ./scripts/create-avalonia-smoke.ps1 `
+            -ProjectDir $projectDir `
+            -NuGetSource "/workspace/artifacts/nuget" `
+            -Tier "$env:TIER" `
+            -PackageVersion "$env:PACKAGE_VERSION" `
+            -AvaloniaVersion "$env:AVALONIA_SMOKE_VERSION"
+          docker run --rm `
+            -v "${{ github.workspace }}:/workspace" `
+            -w /workspace `
+            "${{ env.DOTNET_ALPINE_IMAGE }}" `
+            sh -c "apk add --no-cache clang lld build-base zlib-dev fontconfig-dev && dotnet publish /workspace/artifacts/avalonia-smoke-src/OptrisStaticGraphicsSmoke.csproj -c Release -r $env:RID --configfile /workspace/artifacts/avalonia-smoke-src/NuGet.config /p:PublishAot=true /p:SelfContained=true /p:PublishSingleFile=true /p:StripSymbols=true /p:PublishDir=/workspace/artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/"
+
+      - name: ✅ Verify no dynamic graphics libraries remain
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $publishDir = "artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}"
+          $blocked = Get-ChildItem -Path $publishDir -Recurse -File | Where-Object {
+            $_.Name -in @("libSkiaSharp.dll", "libHarfBuzzSharp.dll", "av_libglesv2.dll", "libSkiaSharp.so", "libHarfBuzzSharp.so", "libSkiaSharp.dylib", "libHarfBuzzSharp.dylib")
+          }
+          if ($blocked) {
+            $blocked | ForEach-Object { Write-Error "Unexpected dynamic graphics library: $($_.FullName)" }
+            exit 1
+          }
+          Get-ChildItem -Path $publishDir -Recurse -File | ForEach-Object { $_.FullName }
+
+      - name: ✅ Verify Windows executable architecture
+        if: ${{ startsWith(matrix.rid, 'win-') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $app = Join-Path $PWD "artifacts/smoke-${{ matrix.tier }}-${{ matrix.rid }}/OptrisStaticGraphicsSmoke.exe"
+          $expectedMachine = @{
+            "win-x64" = "8664 machine"
+            "win-x86" = "14C machine"
+            "win-arm64" = "AA64 machine"
+          }[$env:RID]
+          $headers = & dumpbin /headers $app | Out-String
+          if ($LASTEXITCODE -ne 0 -or $headers -notmatch [regex]::Escape($expectedMachine)) {
+            throw "Expected $expectedMachine in PE headers for $app.`n$headers"
+          }
+
+      # Without a software Vulkan driver the Vulkan tier could not be smoke-tested on Windows at
+      # all - the symbol assertion would prove the backend is PRESENT while nothing proved it
+      # RENDERS. Pinned to one release and checked against the SHA-256 GitHub publishes for that
+      # asset, so it cannot silently become a different binary; it never enters a package, and this
+      # job has no id-token permission, so it cannot reach the publishing path either.
+      - name: 🌋 Install lavapipe (software Vulkan)
+        if: ${{ startsWith(matrix.rid, 'win-') && matrix.rid != 'win-arm64' && matrix.tier == 'Vulkan' }}
+        shell: pwsh
+        env:
+          MESA_URL: https://github.com/pal1000/mesa-dist-win/releases/download/26.1.7/mesa3d-26.1.7-release-msvc.7z
+          MESA_SHA256: c6e90c3117233b66f7816df05026a5fb0f88eaf7829bd07a1724b981487ec0bb
+        run: |
+          $ErrorActionPreference = "Stop"
+          $archive = Join-Path $env:RUNNER_TEMP "mesa.7z"
+          Invoke-WebRequest -Uri $env:MESA_URL -OutFile $archive
+          $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $env:MESA_SHA256) {
+            throw "lavapipe archive checksum mismatch. Expected $env:MESA_SHA256, got $actual. Refusing to run an unverified driver."
+          }
+          # x86 ships its own build; the ICD manifest names the dll beside it, so both files move together.
+          $arch = if ($env:RID -eq "win-x86") { "x86" } else { "x64" }
+          $icdName = if ($arch -eq "x86") { "lvp_icd.x86.json" } else { "lvp_icd.x86_64.json" }
+          $dest = Join-Path $env:RUNNER_TEMP "lavapipe"
+          & 7z x $archive "-o$dest" -y "$arch/vulkan_lvp.dll" "$arch/$icdName" | Out-Null
+          $icd = Join-Path $dest "$arch/$icdName"
+          if (-not (Test-Path $icd)) { throw "lavapipe ICD not found at $icd after extraction." }
+
+          # An ICD is unreachable without a loader: vulkan-1.dll is what vkCreateInstance resolves
+          # from, and a runner with no GPU has no driver to bring one. Missing, the Vulkan smoke
+          # fails as Avalonia's generic "RenderingMode has a value of Vulkan, but no options were
+          # applied" - the symptom, not the cause. Say it here instead.
+          & 7z x $archive "-o$dest" -y "$arch/vulkan-1.dll" 2>$null | Out-Null
+          $bundledLoader = Join-Path $dest "$arch/vulkan-1.dll"
+          $systemLoader = Join-Path $env:SystemRoot "System32/vulkan-1.dll"
+          if (Test-Path $bundledLoader) {
+            Write-Host "Vulkan loader: $bundledLoader (from the mesa archive)"
+            # Beside the app is the first place Windows looks, and it beats any system copy.
+            "$dest/$arch" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+          } elseif (Test-Path $systemLoader) {
+            Write-Host "Vulkan loader: $systemLoader (shipped with Windows)"
+          } else {
+            throw ("No Vulkan loader (vulkan-1.dll) on this runner, so the lavapipe ICD just " +
+                   "installed cannot be reached and the Vulkan smoke cannot run. Absent from both " +
+                   "the mesa archive and $systemLoader. Install the Vulkan runtime for this leg, " +
+                   "or drop Vulkan from the backends proven on $env:RID the way win-arm64 and " +
+                   "osx-* already do - but do not leave a tier claiming a backend no run has " +
+                   "ever exercised.")
+          }
+          # VK_DRIVER_FILES restricts the loader to exactly this ICD, so a passing Vulkan smoke here
+          # is proof the software driver drew it rather than something else on the machine.
+          "VK_DRIVER_FILES=$icd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          Write-Host "lavapipe ICD: $icd"
+
+      # The app's exit code is the whole verdict: there is deliberately no "it was still running, so
+      # it must be fine" branch, because a process that stays alive is precisely what the blank
+      # window this repository exists to catch looks like. That branch is how the defect shipped.
+      - name: ▶️ Smoke the app, once per backend the tier promises
+        if: ${{ !startsWith(matrix.rid, 'linux-musl-') }}
+        shell: bash
+        run: sh scripts/run-smoke.sh
+
+      - name: 🧪 Prove the smoke test can fail
+        if: ${{ !startsWith(matrix.rid, 'linux-musl-') }}
+        shell: bash
+        env:
+          SMOKE_SELFTEST: "1"
+        run: sh scripts/run-smoke.sh
+
+      - name: ✅ Verify musl ELF dependencies
+        if: ${{ startsWith(matrix.rid, 'linux-musl-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e APP="artifacts/smoke-$TIER-$RID/OptrisStaticGraphicsSmoke" \
+            alpine:3.23 \
+            sh -c 'apk add --no-cache binutils pax-utils && readelf -l "$APP" | grep "Requesting program interpreter: /lib/ld-musl-" && scanelf -n "$APP" && ! scanelf -n "$APP" | grep -E "ld-linux|ld64.so"'
+
+      # One container for both phases: the apk install costs far more than either run does, and a
+      # negative control that is skipped whenever the real runs fail is not a control at all.
+      - name: ▶️ Smoke the musl app per backend, then prove it can fail
+        if: ${{ startsWith(matrix.rid, 'linux-musl-') }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "artifacts/smoke-logs/$TIER-$RID"
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            -e SMOKE_TIER \
+            -e SMOKE_BACKENDS \
+            -e SMOKE_LABEL \
+            -e SMOKE_DIR="/workspace/artifacts/smoke-$TIER-$RID" \
+            -e SMOKE_LOG_DIR="/workspace/artifacts/smoke-logs/$TIER-$RID" \
+            -e SMOKE_LAUNCHER="xvfb-run -a" \
+            alpine:3.23 \
+            sh -c 'apk add --no-cache xvfb-run libstdc++ libgcc fontconfig freetype ttf-dejavu \
+                     libx11 libxcb libxext libxrender libxi libxrandr libxcursor libxfixes libxinerama libice libsm \
+                     mesa-gl mesa-egl mesa-dri-gallium mesa-vulkan-swrast vulkan-loader || exit 1
+                   fc-cache -f || exit 1
+                   fc-match sans || exit 1
+                   status=0
+                   sh /workspace/scripts/run-smoke.sh || status=1
+                   SMOKE_SELFTEST=1 sh /workspace/scripts/run-smoke.sh || status=1
+                   exit $status'
+
+      # A blank frame is the evidence, so the frames and the reports go up whether the job passed or
+      # failed - a red run without the picture it read back is just an assertion nobody can check.
+      - name: 📤 Upload smoke frames and reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: repack-smoke-evidence-${{ matrix.tier }}-${{ matrix.rid }}
+          path: artifacts/smoke-logs/${{ matrix.tier }}-${{ matrix.rid }}/**
+          if-no-files-found: warn
+
+  publish-nuget:
+    name: 🚀 Publish to nuget.org
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Trusted Publishing, same as release.yml - no stored key. id-token: write is what lets the job
+    # ask GitHub for the token nuget.org trusts, and the policies are per workflow file, so
+    # publishing from repack.yml needs its own policy naming repack.yml.
+    permissions:
+      id-token: write
+      contents: read
+    needs:
+      - repack
+      - verify-consumer-guard
+      - smoke
+    # Spelled out rather than left to GitHub's skip propagation, for the reason release.yml gives:
+    # publishing is the one irreversible step, and a job that is skipped rather than run still
+    # leaves the workflow green. Naming each result makes "nothing ships that has not rendered a
+    # frame" a property of this file. The push itself used to sit in the matrix job above, with no
+    # frame, no probe build, and nothing to gate on.
+    if: >-
+      ${{ inputs.publish_to_nuget == true
+          && needs.repack.result == 'success'
+          && needs['verify-consumer-guard'].result == 'success'
+          && needs.smoke.result == 'success' }}
+    steps:
+      - name: 🟣 Setup .NET
+        uses: actions/setup-dotnet@v5
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: 📥 Download the repacked packages
+        uses: actions/download-artifact@v7
+        with:
+          pattern: repacked-nuget-*
+          path: artifacts/nuget
+          merge-multiple: true
+
+      # Immediately before the push, deliberately: the key nuget.org hands back is valid for one
+      # hour, and one OIDC token buys exactly one key.
       - name: 🔑 NuGet login (OIDC)
-        if: ${{ inputs.publish_to_nuget == true }}
         uses: NuGet/login@v1
         id: nuget-login
         with:
           user: ${{ vars.NUGET_USER || 'saitz-optris' }}
 
-      - name: 🚀 Push to nuget.org
-        if: ${{ inputs.publish_to_nuget == true }}
+      - name: 🚀 Push
         working-directory: artifacts/nuget
         env:
           NUGET_API_KEY: ${{ steps.nuget-login.outputs.NUGET_API_KEY }}
@@ -160,6 +855,7 @@ jobs:
             echo "::error::The OIDC exchange returned no key. nuget.org policies are per workflow file - check one exists naming repack.yml, or repack through release.yml."
             exit 1
           fi
+          ls -la
           dotnet nuget push "*.nupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
           if compgen -G "*.snupkg" > /dev/null; then
             dotnet nuget push "*.snupkg" --source https://api.nuget.org/v3/index.json --api-key "$NUGET_API_KEY" --skip-duplicate
