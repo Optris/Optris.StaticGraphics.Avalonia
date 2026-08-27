@@ -618,18 +618,21 @@ function Build-Skia {
         Invoke-SkiaGitSyncDeps $skiaDir
     }
 
-    # Ganesh is Skia's GPU pipeline, so it is on for every tier that has a GPU backend at
-    # all. gn/skia.gni forces skia_use_gl false as soon as Ganesh is off, which is what
-    # takes GL out of the Software tier.
-    # RISK (unverified here - building Skia needs depot_tools and hours): SkiaSharp's C API
-    # in src/c/gr_context.cpp may not compile with Ganesh disabled. If a Software build
-    # fails there, replace skia_enable_ganesh = false with
-    #   skia_enable_ganesh = true
-    #   skia_use_gl = false
-    # which keeps the C API compiling, still drops ANGLE - the bulk of the size win - and
-    # still satisfies Assert-TierSymbols, because GrGLGpu/GrGLInterface are compiled only
-    # when skia_use_gl is true.
-    $skiaEnableGanesh = if ($Backends -contains "OpenGL") { "true" } else { "false" }
+    # Ganesh stays ON for every tier, including Software, and skia_use_gl is what actually
+    # distinguishes them.
+    # This was skia_enable_ganesh = false for Software, which is the tidier expression of
+    # "no GPU pipeline at all" and does not compile: SkiaSharp's C API is written assuming
+    # Ganesh exists, and the Software build failed with
+    #   src/c/gr_context.cpp:46: error: non-void function
+    #   'gr_recording_context_get_direct_context' should return a value
+    # because SK_ONLY_GPU collapses to nothing and leaves the function with no return. The
+    # C API stubs absent BACKENDS but not an absent pipeline.
+    # Turning GL off instead keeps the API compiling, still drops ANGLE - the bulk of the
+    # size win - and still satisfies Assert-TierSymbols, because GrGLGpu and GrGLInterface
+    # are compiled only when skia_use_gl is true. The Software tier therefore carries
+    # Ganesh's raster path and no GPU backend, which is exactly what it promises.
+    $skiaEnableGanesh = "true"
+    $skiaUseGl = if ($Backends -contains "OpenGL") { "true" } else { "false" }
     # Skia vendors the Vulkan headers and gn/skia.gni derives skia_use_vma from
     # skia_use_vulkan, so no new dependency is needed here. Skia never links a Vulkan
     # library either - it resolves entry points through a caller-supplied proc-address
@@ -661,6 +664,7 @@ is_static_skiasharp = true
 is_clang = true
 skia_enable_tools = false
 skia_enable_ganesh = $skiaEnableGanesh
+skia_use_gl = $skiaUseGl
 skia_enable_pdf = false
 skia_enable_skottie = false
 skia_use_dng_sdk = false
