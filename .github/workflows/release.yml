@@ -44,6 +44,11 @@ on:
         required: false
         default: false
         type: boolean
+      include_macos:
+        description: Build and ship the osx RIDs (off - the macOS symbol reader is unreliable)
+        required: false
+        default: false
+        type: boolean
   workflow_call:
     inputs:
       tiers:
@@ -71,6 +76,10 @@ on:
         default: false
         type: boolean
       allow_republish:
+        required: false
+        default: false
+        type: boolean
+      include_macos:
         required: false
         default: false
         type: boolean
@@ -150,6 +159,10 @@ jobs:
 
   build-macos:
     needs: preflight
+    # Opt-in. The macOS symbol reader reports every backend missing from an archive that has just
+    # compiled cleanly, so the tier contract cannot be verified there - and shipping a tier whose
+    # contract was not checked is the exact thing this repository exists to refuse.
+    if: ${{ inputs.include_macos }}
     uses: ./.github/workflows/static-graphics-macos.yml
     with:
       skiasharp_version: ${{ needs.preflight.outputs.skiasharp_version }}
@@ -171,6 +184,9 @@ jobs:
       - build-linux
       - build-musl
       - build-macos
+    # A skipped `needs` skips its dependents by default, and build-macos is skipped whenever
+    # include_macos is off - which is the normal case. This runs unless something actually failed.
+    if: ${{ !failure() && !cancelled() }}
     strategy:
       fail-fast: false
       matrix:
@@ -228,6 +244,7 @@ jobs:
         uses: ./.github/actions/verify-tier-payload
         with:
           tier: ${{ matrix.tier }}
+          include_macos: ${{ inputs.include_macos }}
 
       - name: 📦 Pack
         shell: bash
@@ -425,6 +442,11 @@ jobs:
       matrix:
         tier: ${{ fromJSON(needs.preflight.outputs.tiers) }}
         rid: [win-x64, win-x86, win-arm64, linux-x64, linux-arm64, linux-musl-x64, linux-musl-arm64, osx-x64, osx-arm64]
+        # Dropped rather than gated with a job-level `if`: the matrix context is not available
+        # there, so such a condition silently evaluates true and the job runs anyway. exclude is
+        # evaluated with the inputs context, which is. The osx entries stay in the list above so
+        # turning include_macos on needs no matrix surgery.
+        exclude: ${{ fromJSON(inputs.include_macos && '[]' || '[{"rid":"osx-x64"},{"rid":"osx-arm64"}]') }}
         include:
           - rid: win-x64
             runner: windows-2022

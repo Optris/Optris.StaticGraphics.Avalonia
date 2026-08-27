@@ -9,6 +9,13 @@ inputs:
     description: Directory holding one subdirectory per RID
     required: false
     default: ""
+  include_macos:
+    description: >-
+      Whether the osx RIDs are expected in this payload. The macOS symbol reader is unreliable
+      (an archive that had just compiled cleanly reported every backend missing), so macOS is
+      currently built out of the release path rather than shipped unverified.
+    required: false
+    default: "false"
 
 runs:
   using: composite
@@ -18,6 +25,7 @@ runs:
       env:
         TIER: ${{ inputs.tier }}
         ROOT: ${{ inputs.root }}
+        INCLUDE_MACOS: ${{ inputs.include_macos }}
       run: |
         python3 - <<'PY'
         import os
@@ -35,8 +43,9 @@ runs:
         unix_rids = [
             "linux-x64", "linux-arm64",
             "linux-musl-x64", "linux-musl-arm64",
-            "osx-x64", "osx-arm64",
         ]
+        if os.environ.get("INCLUDE_MACOS", "false").lower() == "true":
+            unix_rids += ["osx-x64", "osx-arm64"]
         angle_stems = ("libANGLE_static.", "libGLESv2_static.")
         failures = []
 
