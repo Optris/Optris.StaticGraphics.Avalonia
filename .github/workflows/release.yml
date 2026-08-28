@@ -805,19 +805,41 @@ jobs:
             if ($LASTEXITCODE -ne 0) {
               throw "The Vulkan SDK installer exited $LASTEXITCODE."
             }
-            # Bin is the 64-bit loader, Bin32 the 32-bit one. win-x86 needs the latter, and an
-            # x64 loader would load but refuse every 32-bit ICD, so the bitness is chosen here
-            # rather than left to whatever the search order happens to find first.
-            $binDir = if ($arch -eq "x86") { "Bin32" } else { "Bin" }
-            $found = Get-ChildItem -Path $sdkRoot -Recurse -Filter "vulkan-1.dll" -ErrorAction SilentlyContinue |
-              Where-Object { $_.DirectoryName -match [regex]::Escape($binDir) + "$" } |
-              Select-Object -First 1
+            # Bitness is decided by reading the PE header, not by the directory a file sits in.
+            # The first attempt looked only in Bin (x64) and Bin32 (x86) - the historical SDK
+            # layout - and threw "carries no Bin/vulkan-1.dll" on an SDK that had installed
+            # perfectly well. Where the loader lives is the SDK's business and it has moved before;
+            # what it IS can be read off the file. An x64 loader on the x86 leg would load happily
+            # and then refuse every 32-bit ICD, which is why this cannot just take the first hit.
+            $wantMachine = if ($arch -eq "x86") { 0x014C } else { 0x8664 }
+            $found = $null
+            foreach ($candidate in Get-ChildItem -Path $sdkRoot -Recurse -Filter "vulkan-1.dll" -ErrorAction SilentlyContinue) {
+              try {
+                $fs = [System.IO.File]::OpenRead($candidate.FullName)
+                $br = New-Object System.IO.BinaryReader($fs)
+                $fs.Position = 0x3C
+                $peOffset = $br.ReadInt32()
+                $fs.Position = $peOffset
+                if ($br.ReadUInt32() -eq 0x00004550) {
+                  $machine = $br.ReadUInt16()
+                  if ($machine -eq $wantMachine) { $found = $candidate }
+                }
+              } catch {
+              } finally {
+                if ($br) { $br.Dispose() }
+                if ($fs) { $fs.Dispose() }
+              }
+              if ($found) { break }
+            }
             if (-not $found) {
-              throw ("The Vulkan SDK installed but carries no $binDir/vulkan-1.dll, so there is no " +
-                     "$arch loader for the lavapipe ICD and the Vulkan smoke cannot run on " +
-                     "$env:RID. Either supply a $arch loader another way, or drop Vulkan from the " +
-                     "backends proven on this RID the way win-arm64 and osx-* already do - but do " +
-                     "not leave a tier claiming a backend no run has ever exercised.")
+              $seen = (Get-ChildItem -Path $sdkRoot -Recurse -Filter "vulkan-1.dll" -ErrorAction SilentlyContinue |
+                       ForEach-Object { $_.FullName }) -join "; "
+              throw ("The Vulkan SDK installed but carries no $arch vulkan-1.dll, so there is no " +
+                     "loader for the lavapipe ICD and the Vulkan smoke cannot run on $env:RID. " +
+                     "vulkan-1.dll copies found: " + $(if ($seen) { $seen } else { "none at all" }) +
+                     ". Either supply a $arch loader another way, or drop Vulkan from the backends " +
+                     "proven on this RID the way win-arm64 and osx-* already do - but do not leave " +
+                     "a tier claiming a backend no run has ever exercised.")
             }
             Copy-Item $found.FullName (Join-Path $dest "$arch/vulkan-1.dll") -Force
             Write-Host "Vulkan loader: $($found.FullName) -> $dest/$arch (from LunarG SDK $env:VULKAN_SDK_VERSION)"
