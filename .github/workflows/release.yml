@@ -597,26 +597,31 @@ jobs:
           # On macOS the top tier is spelled Vulkan and delivered by Metal: Vulkan only reaches Apple
           # hardware through MoltenVK, which Skia does not vendor, so build-macos-static-graphics.sh
           # sets skia_use_metal and the payload verifier asserts GrMtlGpu. Metal is therefore
-          # osx DROPS Vulkan rather than substituting Metal for it, and that is a known gap rather
-          # than a considered design: on macOS this tier IS Metal, so the honest thing would be to
-          # prove Metal here. We cannot yet. Avalonia's Metal path resolves
+          # osx proves SOFTWARE ONLY here, and both omissions are recorded rather than quietly
+          # arranged. Neither is a defect in the payload; both are things this runner cannot host.
+          #
+          # Vulkan is dropped instead of being substituted with Metal, which is what this tier
+          # actually is on macOS. Avalonia reaches Metal by resolving
           # gr_direct_context_make_metal_with_options and gr_backendrendertarget_new_metal BY NAME
-          # out of a dynamically loaded libSkiaSharp (SkiaSharp exposes no managed Metal
-          # GRContext API), and a statically linked build has no such library - this package
-          # deletes it, and a step below asserts it is gone. So SkiaMetalApi's constructor throws
-          # DllNotFoundException before Metal is ever reached.
-          # The payload is not at fault: libskia.a carries 152 GrMtlGpu symbols and both entry
-          # points. They are simply unreachable, and the published binary exports none of them.
-          # Consequence worth stating out loud: the GrMtlGpu assertion in verify-tier-payload
-          # PASSES for a backend that cannot run. Presence is not reachability. See
-          # "Known gap: Metal on macOS" in README.md - the smoke app already supports
-          # OPTRIS_SMOKE_BACKEND=Metal, so whoever picks this up can reproduce it in one command.
-          # win-arm64 drops Vulkan for an unrelated and simpler reason: lavapipe publishes no
-          # arm64 Windows build, so there is no software ICD to render with. It used to skip the
-          # app entirely and report the job green having drawn nothing at all - the failure shape
-          # this whole pipeline exists to refuse, sitting inside the step named for catching it.
+          # out of a dynamically loaded libSkiaSharp - SkiaSharp exposes no managed Metal GRContext
+          # API - and a statically linked build has no such library, because this package deletes
+          # it and a step below asserts it is gone. SkiaMetalApi throws DllNotFoundException before
+          # Metal is ever reached. Measured on an M4 Pro: exit 134. Substituting Metal would only
+          # turn these legs red without making anything work.
+          #
+          # OpenGL is dropped because these runners are virtualised and cannot hand Avalonia a GL
+          # context: Skia returns a null GRContext and the app silently degrades to Software, which
+          # is precisely the shape this pipeline refuses to accept as a pass. It is NOT broken in
+          # the package - on real Apple hardware in a GUI session the same binary renders it, with
+          # "Skia has a GPU context: GRContext backend OpenGL" and every pixel assertion green,
+          # against renderer 'Apple M4 Pro'. CI cannot reproduce that, so it does not pretend to.
+          #
+          # Both are written up in README.md under "Known gap: Metal on macOS", with the
+          # measurements and the reproduction. win-arm64 drops Vulkan for a simpler and unrelated
+          # reason: lavapipe publishes no arm64 Windows build, so there is no software ICD there.
           case "$RID" in
-            osx-*|win-arm64) backends="$(printf '%s\n' $backends | grep -vx Vulkan | tr '\n' ' ' || true)" ;;
+            osx-*)     backends="$(printf '%s\n' $backends | grep -vxE 'Vulkan|OpenGL' | tr '\n' ' ' || true)" ;;
+            win-arm64) backends="$(printf '%s\n' $backends | grep -vx Vulkan | tr '\n' ' ' || true)" ;;
           esac
 
           # GLX needs an X server that offers the extension AND a GL implementation behind it.
