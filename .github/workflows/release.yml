@@ -565,7 +565,7 @@ jobs:
           # failure under test does not need one: Avalonia hands Skia a real VkDevice either way, and
           # a Skia built without Vulkan still answers with a null GRContext.
           sudo apt-get install -y clang lld xvfb zlib1g-dev libfontconfig1-dev libfreetype6 fonts-dejavu-core \
-            libgl1 libgl1-mesa-dri libegl1 libvulkan1 mesa-vulkan-drivers \
+            libgl1 libgl1-mesa-dri libegl1 libgles2 libvulkan1 mesa-vulkan-drivers \
             libice6 libsm6 libx11-6 libxcb1 libxcursor1 libxext6 libxfixes3 libxinerama1 libxrandr2 libxrender1 libxi6
 
       - name: 🟣 Setup .NET
@@ -646,17 +646,13 @@ jobs:
             echo "SMOKE_LAUNCHER=$launcher"
           } >> "$GITHUB_ENV"
 
-          # Force Mesa's software GL for the Linux legs. Without it libGL looks for a hardware
-          # driver, finds none, and GLX context creation fails - taking the OpenGL backend of
-          # every Linux tier with it, including the Vulkan tier, which must prove OpenGL too.
-          case "$RID" in
-            linux-*)
-              {
-                echo "LIBGL_ALWAYS_SOFTWARE=1"
-                echo "GALLIUM_DRIVER=llvmpipe"
-              } >> "$GITHUB_ENV"
-              ;;
-          esac
+          # There used to be LIBGL_ALWAYS_SOFTWARE and GALLIUM_DRIVER exports here, on the theory
+          # that the Linux OpenGL legs were failing for want of a software rasteriser. They were
+          # not, and the variables changed nothing. Reproduced in a container: glxinfo already
+          # reports llvmpipe with direct rendering and no such variables, and the OpenGL leg still
+          # failed - because Avalonia's GLX backend cannot initialise under Xvfb at all. EGL can,
+          # which is what the smoke app now asks for. Removed rather than left in place: config
+          # kept "just in case" is how the next person inherits a wrong explanation.
           echo "$TIER on $RID will be proven with: $backends"
 
       - name: 🔥 Publish single-file smoke app

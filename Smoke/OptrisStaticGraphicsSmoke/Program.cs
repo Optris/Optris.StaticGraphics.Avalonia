@@ -81,7 +81,17 @@ internal static class Program
                 RenderingMode = [options.RequestedBackend switch
                 {
                     Backend.Vulkan => X11RenderingMode.Vulkan,
-                    Backend.OpenGL => X11RenderingMode.Glx,
+                    // EGL, not Glx, and the difference is the whole reason the Linux OpenGL legs
+                    // can be proven at all. Avalonia's GLX backend cannot initialise under Xvfb -
+                    // it fails with "X11PlatformOptions.RenderingMode has a value of Glx, but no
+                    // options were applied", which is Avalonia reporting that the mode could not
+                    // be created. That is NOT this package's doing: a stock Avalonia app with the
+                    // dynamic SkiaSharp, no Optris package anywhere, fails identically in the same
+                    // container, while glxinfo in that container reports llvmpipe and direct
+                    // rendering. EGL initialises there and renders, and it exercises the same Skia
+                    // GL backend the tier claims - Skia reports 'OpenGL' and hands back a real
+                    // GRContext. Measured, not assumed.
+                    Backend.OpenGL => X11RenderingMode.Egl,
                     _ => X11RenderingMode.Software,
                 }],
             });
