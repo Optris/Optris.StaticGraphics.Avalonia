@@ -594,13 +594,27 @@ jobs:
             *) echo "::error::Unknown tier '$TIER'."; exit 1 ;;
           esac
 
-          # Avalonia has no Vulkan backend on macOS, and the app refuses such a run with exit 3 rather
-          # than accepting Metal in its place; a Vulkan tier is proven there by its other two backends.
-          # win-arm64 keeps OpenGL and Software but drops Vulkan: lavapipe publishes no arm64
-          # Windows build, so there is no software ICD to render with there. That single backend is
-          # the only part of win-arm64 that cannot be proven. It used to skip the app entirely and
-          # report the job green having drawn nothing at all - the failure shape this whole
-          # pipeline exists to refuse, sitting inside the step named for catching it.
+          # On macOS the top tier is spelled Vulkan and delivered by Metal: Vulkan only reaches Apple
+          # hardware through MoltenVK, which Skia does not vendor, so build-macos-static-graphics.sh
+          # sets skia_use_metal and the payload verifier asserts GrMtlGpu. Metal is therefore
+          # osx DROPS Vulkan rather than substituting Metal for it, and that is a known gap rather
+          # than a considered design: on macOS this tier IS Metal, so the honest thing would be to
+          # prove Metal here. We cannot yet. Avalonia's Metal path resolves
+          # gr_direct_context_make_metal_with_options and gr_backendrendertarget_new_metal BY NAME
+          # out of a dynamically loaded libSkiaSharp (SkiaSharp exposes no managed Metal
+          # GRContext API), and a statically linked build has no such library - this package
+          # deletes it, and a step below asserts it is gone. So SkiaMetalApi's constructor throws
+          # DllNotFoundException before Metal is ever reached.
+          # The payload is not at fault: libskia.a carries 152 GrMtlGpu symbols and both entry
+          # points. They are simply unreachable, and the published binary exports none of them.
+          # Consequence worth stating out loud: the GrMtlGpu assertion in verify-tier-payload
+          # PASSES for a backend that cannot run. Presence is not reachability. See
+          # "Known gap: Metal on macOS" in README.md - the smoke app already supports
+          # OPTRIS_SMOKE_BACKEND=Metal, so whoever picks this up can reproduce it in one command.
+          # win-arm64 drops Vulkan for an unrelated and simpler reason: lavapipe publishes no
+          # arm64 Windows build, so there is no software ICD to render with. It used to skip the
+          # app entirely and report the job green having drawn nothing at all - the failure shape
+          # this whole pipeline exists to refuse, sitting inside the step named for catching it.
           case "$RID" in
             osx-*|win-arm64) backends="$(printf '%s\n' $backends | grep -vx Vulkan | tr '\n' ' ' || true)" ;;
           esac

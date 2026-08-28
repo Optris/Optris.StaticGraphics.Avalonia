@@ -1,17 +1,31 @@
 namespace Optris.StaticGraphics.Smoke;
 
 /// <summary>
-/// The three tier names of the package contract, richest first.
+/// The backends a run can be forced onto: the three tier names of the package contract, richest
+/// first, and then Metal.
 /// </summary>
 /// <remarks>
-/// Ordered so that a tier supports every backend whose value is greater than or equal to its own:
-/// each tier is a strict superset of the one below it.
+/// The three tier names are ordered so that a tier supports every backend whose value is greater
+/// than or equal to its own: each tier is a strict superset of the one below it.
+/// Metal sits outside that order on purpose and is ranked by <see cref="SmokeOptions.TierOf"/>
+/// instead, because it is not a fourth tier - see its own note below.
 /// </remarks>
 internal enum Backend
 {
     Vulkan = 0,
     OpenGL = 1,
     Software = 2,
+
+    /// <summary>
+    /// The Vulkan tier's GPU backend on macOS.
+    /// </summary>
+    /// <remarks>
+    /// Vulkan only reaches Apple hardware through MoltenVK, which Skia does not vendor, so the top
+    /// tier is built with skia_use_metal and its frames come out of GrMtlGpu. The tier is still
+    /// spelled "Vulkan" in package ids and in what the payload advertises - Metal is what that name
+    /// is made of here, which is why it is a backend and never a tier.
+    /// </remarks>
+    Metal = 3,
 }
 
 internal enum SelfTest
@@ -55,8 +69,18 @@ internal sealed class SmokeOptions
 
     public string? LinkedBackends { get; init; }
 
+    /// <summary>
+    /// The tier that carries a backend, which is the rank the superset ordering is compared on.
+    /// </summary>
+    /// <remarks>
+    /// Every backend names its own tier except Metal, which has no tier of its own: it ships inside
+    /// the Vulkan payload, so the Vulkan tier carries it and the two below it do not. Ranking it
+    /// here rather than by its enum value is what keeps "Software tier, Metal backend" a refusal.
+    /// </remarks>
+    public static Backend TierOf(Backend backend) => backend == Backend.Metal ? Backend.Vulkan : backend;
+
     public static IReadOnlyList<Backend> BackendsOf(Backend tier) =>
-        Enum.GetValues<Backend>().Where(backend => backend >= tier).ToArray();
+        Enum.GetValues<Backend>().Where(backend => TierOf(backend) >= tier).ToArray();
 
     public static string Describe(IEnumerable<Backend> backends) => string.Join(";", backends);
 
@@ -81,7 +105,9 @@ internal sealed class SmokeOptions
             return null;
         }
 
-        if (!TryParseBackend(tierText, out var tier))
+        // Metal parses as a backend but is not a tier and never names a package: the payload that
+        // renders with it is the Vulkan one, so accepting it here would invent a fourth tier.
+        if (!TryParseBackend(tierText, out var tier) || tier == Backend.Metal)
         {
             error = $"OPTRIS_SMOKE_TIER='{tierText}' is not one of Vulkan, OpenGL, Software.";
             return null;
@@ -100,28 +126,46 @@ internal sealed class SmokeOptions
         var backend = tier;
         if (backendText is not null && !TryParseBackend(backendText, out backend))
         {
-            error = $"OPTRIS_SMOKE_BACKEND='{backendText}' is not one of Vulkan, OpenGL, Software.";
+            error = $"OPTRIS_SMOKE_BACKEND='{backendText}' is not one of Vulkan, OpenGL, Software, Metal.";
             return null;
         }
 
-        if (backend < tier)
+        if (TierOf(backend) < tier)
         {
             error = $"The {tier} tier does not carry a {backend} backend. It supports {Describe(BackendsOf(tier))}.";
             return null;
         }
 
+        // A backend is advertised under the name of the tier that carries it, so Metal is looked up
+        // as Vulkan: the payload built with skia_use_metal is the Vulkan payload, and "Metal" never
+        // appears in the list the package writes.
+        var advertisedAs = TierOf(backend);
         if (linkedBackends is not null &&
             !linkedBackends.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
-                .Any(entry => entry.Equals(backend.ToString(), StringComparison.OrdinalIgnoreCase)))
+                .Any(entry => entry.Equals(advertisedAs.ToString(), StringComparison.OrdinalIgnoreCase)))
         {
-            error = $"The linked package advertises backends '{linkedBackends}', which does not include {backend}.";
+            var missing = advertisedAs == backend ? backend.ToString() : $"{advertisedAs}, which is what carries {backend}";
+            error = $"The linked package advertises backends '{linkedBackends}', which does not include {missing}.";
             return null;
         }
 
+        // A backend the platform cannot have is refused outright. Letting the run continue would mean
+        // rendering with something else and reporting on the name that was asked for, which is the
+        // exact substitution this app exists to catch.
         if (backend == Backend.Vulkan && OperatingSystem.IsMacOS())
         {
             error = "Avalonia has no Vulkan backend on macOS, so a Vulkan run here would prove nothing. " +
-                    "Run OPTRIS_SMOKE_BACKEND=OpenGL and OPTRIS_SMOKE_BACKEND=Software on macOS.";
+                    "Metal is what the Vulkan tier is made of on this platform - Skia does not vendor " +
+                    "MoltenVK, so the tier is built with skia_use_metal and draws through GrMtlGpu. " +
+                    "Run OPTRIS_SMOKE_BACKEND=Metal for the top backend, then OpenGL and Software.";
+            return null;
+        }
+
+        if (backend == Backend.Metal && !OperatingSystem.IsMacOS())
+        {
+            error = "Metal exists only on Apple platforms, so a Metal run here would prove nothing. " +
+                    "Metal is how the Vulkan tier renders on macOS; everywhere else that tier renders " +
+                    "with Vulkan itself. Run OPTRIS_SMOKE_BACKEND=Vulkan for the top backend here.";
             return null;
         }
 

@@ -50,6 +50,45 @@ dependency on `vulkan-1`, so a machine with no ICD still falls back the way Aval
 
 macOS is OpenGL or Software. Avalonia has no Vulkan backend there.
 
+### Known gap: Metal on macOS
+
+**The Metal backend is compiled into the macOS payload and cannot currently be used.** The Vulkan
+tier on macOS is meant to be delivered by Metal - Vulkan only reaches Apple hardware through
+MoltenVK, which Skia does not vendor - so `build-macos-static-graphics.sh` sets `skia_use_metal` and
+asserts `GrMtlGpu`. That assertion passes. Metal still cannot render.
+
+Avalonia's Metal support does not go through SkiaSharp's managed bindings, because SkiaSharp exposes
+no managed Metal `GRContext` API. `Avalonia.Skia.Metal.SkiaMetalApi` instead **loads a dynamic
+`libSkiaSharp` at runtime** and resolves `gr_direct_context_make_metal_with_options` and
+`gr_backendrendertarget_new_metal` out of it by name. A statically linked build has no
+`libSkiaSharp.dylib` - this package deletes it on publish, and CI asserts it is gone - so the
+constructor throws `DllNotFoundException` before Metal is ever reached.
+
+Measured on an M4 Pro against `Optris.StaticGraphics.Avalonia.Vulkan` 3.119.4.1:
+
+| | |
+|---|---|
+| `libskia.a` | 152 `GrMtlGpu` symbols, both Metal entry points present |
+| published binary | exports **zero** of them, so no self-`dlopen` fallback could reach them either |
+| `OPTRIS_SMOKE_BACKEND=Metal` | `DllNotFoundException: Unable to load shared library 'libSkiaSharp'`, exit 134 |
+| `=OpenGL`, `=Software` | both render and pass on the same binary |
+
+So the macOS Vulkan tier proves OpenGL and Software, and its top backend is dropped from what CI
+smoke asserts. **`verify-tier-payload`'s `GrMtlGpu` check is therefore necessary but not
+sufficient** - it proves Metal was compiled in, not that it can run. That is an uncomfortable state
+for a repository founded on refusing exactly that gap, which is why it is written down here instead
+of left to be rediscovered.
+
+What would close it: export those two entry points from the AOT binary and register a
+`DllImportResolver` mapping `libSkiaSharp` to the main program handle, so Avalonia's lookup resolves
+against the statically linked Skia. Plausible - the package already uses `DirectPInvoke` for
+`libSkiaSharp` - but unproven.
+
+The smoke app already understands `OPTRIS_SMOKE_BACKEND=Metal` and refuses it on non-macOS, so the
+failure above reproduces in one command. Note that GitHub's macOS runners cannot host this test at
+all: they give Avalonia no usable GPU context, and even the Software backend fails there in a
+background session. Real hardware, in a GUI session, is required.
+
 ## Install
 
 ```xml

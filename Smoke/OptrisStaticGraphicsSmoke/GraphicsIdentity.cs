@@ -58,8 +58,26 @@ internal static class GraphicsIdentity
                 return new ObservedGraphics(Backend.OpenGL, "OpenGL", detail);
             }
 
-            case IMetalDevice:
-                return new ObservedGraphics(null, "Metal", "Metal device; the tiers do not cover Metal");
+            // Metal is the Vulkan tier's backend on macOS: Skia does not vendor MoltenVK, so the
+            // tier is built with skia_use_metal and a frame drawn here is a frame drawn by the top
+            // tier, which is why this reports a backend rather than an unclassified device.
+            case IMetalDevice metal:
+            {
+                var detail = "Metal device";
+                try
+                {
+                    // Avalonia keeps the MTLDevice and command queue handles internal to itself -
+                    // IMetalDevice exposes nothing of them to a consumer - so the evidence available
+                    // here is the device Avalonia actually handed Skia and whether it is still alive.
+                    detail = $"Metal device {metal.GetType().Name}, context {(metal.IsLost ? "LOST" : "live")}";
+                }
+                catch (Exception ex)
+                {
+                    detail = $"Metal device, details unreadable ({ex.GetType().Name})";
+                }
+
+                return new ObservedGraphics(Backend.Metal, "Metal", detail);
+            }
 
             default:
                 return new ObservedGraphics(null, context.GetType().Name, $"unrecognised platform graphics context {context.GetType().FullName}");

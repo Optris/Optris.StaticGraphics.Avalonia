@@ -93,6 +93,10 @@ internal static class Program
             {
                 RenderingMode = [options.RequestedBackend switch
                 {
+                    // Metal, not Vulkan, is the top backend here: the tier is built with
+                    // skia_use_metal because Skia does not vendor MoltenVK. SmokeOptions has
+                    // already refused a Vulkan run on macOS, so it cannot reach this switch.
+                    Backend.Metal => AvaloniaNativeRenderingMode.Metal,
                     Backend.OpenGL => AvaloniaNativeRenderingMode.OpenGl,
                     _ => AvaloniaNativeRenderingMode.Software,
                 }],
@@ -105,8 +109,10 @@ internal static class Program
     private const string Usage = """
            OPTRIS_SMOKE_TIER             Vulkan | OpenGL | Software. Defaults to the tier baked in by the
                                          Optris.StaticGraphics.Avalonia.* package reference.
-           OPTRIS_SMOKE_BACKEND          Vulkan | OpenGL | Software. The backend to force for this run.
-                                         Defaults to the richest backend the tier promises.
+           OPTRIS_SMOKE_BACKEND          Vulkan | OpenGL | Software | Metal. The backend to force for
+                                         this run. Defaults to the richest backend the tier promises.
+                                         Metal is the Vulkan tier's GPU backend on macOS and is
+                                         accepted only there; Vulkan is accepted everywhere else.
            OPTRIS_SMOKE_TIMEOUT_SECONDS  Watchdog for the whole run. Default 30.
            OPTRIS_SMOKE_REQUIRE_TEXT     0 to accept a frame whose caption never rasterised. Default on.
            OPTRIS_SMOKE_FRAME            Path to write the captured frame to, as a BMP.

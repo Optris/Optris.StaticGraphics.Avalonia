@@ -108,6 +108,13 @@ runs:
         # never sets skia_use_vulkan. That rule lived only in the build script; this verifier
         # asked every unix RID for GrVkGpu and so failed both osx legs the first time macOS
         # was let into the release path, on archives that were exactly right.
+        # NOTE what this can and cannot tell you. It proves Metal was COMPILED IN. It does not
+        # prove Metal can run, and today it cannot: Avalonia reaches Metal by resolving Skia's C
+        # entry points by name out of a dynamically loaded libSkiaSharp, which a statically linked
+        # build does not have, so the backend throws before it draws. This check passing is
+        # therefore necessary and not sufficient, which is an uncomfortable thing for a repository
+        # founded on refusing exactly that gap - it is recorded in README.md under
+        # "Known gap: Metal on macOS" rather than left for someone to rediscover.
         metal_gpu = ["GrMtlGpu"]
         vulkan_gpu = ["GrVkGpu"]
         vulkan_context = ["GrVkBackendContext", "VulkanBackendContext"]
