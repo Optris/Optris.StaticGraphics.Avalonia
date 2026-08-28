@@ -744,6 +744,9 @@ jobs:
         env:
           MESA_URL: https://github.com/pal1000/mesa-dist-win/releases/download/26.1.7/mesa3d-26.1.7-release-msvc.7z
           MESA_SHA256: c6e90c3117233b66f7816df05026a5fb0f88eaf7829bd07a1724b981487ec0bb
+          VULKAN_SDK_VERSION: 1.4.357.0
+          VULKAN_SDK_URL: https://sdk.lunarg.com/sdk/download/1.4.357.0/windows/vulkansdk-windows-X64-1.4.357.0.exe
+          VULKAN_SDK_SHA256: 81f474711e9042f4cd22b31b2f7a8870db2e428b21586fb43dd80150be97310d
         run: |
           $ErrorActionPreference = "Stop"
           $archive = Join-Path $env:RUNNER_TEMP "mesa.7z"
@@ -762,29 +765,50 @@ jobs:
 
           # An ICD is not reachable without a loader. vulkan-1.dll is what vkCreateInstance is
           # resolved from, and installing lavapipe alone leaves nothing to load it: the Vulkan
-          # smoke then fails with Avalonia's generic "RenderingMode has a value of Vulkan, but no
+          # smoke failed with Avalonia's generic "RenderingMode has a value of Vulkan, but no
           # options were applied", which names the symptom and not the cause. Linux gets a loader
           # from libvulkan1 in the apt line; Windows normally gets one from a GPU driver, and a
-          # GitHub runner has no GPU.
-          # Try the archive first (some mesa builds ship a loader beside the ICD), then the OS
-          # copy. If neither exists, say so here rather than letting it surface as a rendering
-          # mystery three steps later.
-          & 7z x $archive "-o$dest" -y "$arch/vulkan-1.dll" 2>$null | Out-Null
-          $bundledLoader = Join-Path $dest "$arch/vulkan-1.dll"
+          # GitHub runner has no GPU. Confirmed against the pinned mesa archive: it ships
+          # vulkan_lvp.dll and vulkan_dzn.dll and their ICD manifests, and no loader at all.
+          # So the loader comes from LunarG's SDK, pinned by version AND by hash for the same
+          # reason the mesa archive is - this is a driver component reaching a machine that then
+          # certifies what we publish.
           $systemLoader = Join-Path $env:SystemRoot "System32/vulkan-1.dll"
-          if (Test-Path $bundledLoader) {
-            Write-Host "Vulkan loader: $bundledLoader (from the mesa archive)"
-            # Beside the app is the first place Windows looks, and it beats any system copy.
-            "$dest/$arch" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
-          } elseif (Test-Path $systemLoader) {
-            Write-Host "Vulkan loader: $systemLoader (shipped with Windows)"
+          if (Test-Path $systemLoader) {
+            Write-Host "Vulkan loader: $systemLoader (already present)"
           } else {
-            throw ("No Vulkan loader (vulkan-1.dll) on this runner, so the lavapipe ICD just " +
-                   "installed cannot be reached and the Vulkan smoke cannot run. Absent from both " +
-                   "the mesa archive and $systemLoader. Install the Vulkan runtime for this leg, " +
-                   "or drop Vulkan from the backends proven on $env:RID the way win-arm64 and " +
-                   "osx-* already do - but do not leave a tier claiming a backend no run has " +
-                   "ever exercised.")
+            $sdk = Join-Path $env:RUNNER_TEMP "vulkansdk.exe"
+            Invoke-WebRequest -Uri $env:VULKAN_SDK_URL -OutFile $sdk
+            $sdkHash = (Get-FileHash $sdk -Algorithm SHA256).Hash.ToLower()
+            if ($sdkHash -ne $env:VULKAN_SDK_SHA256) {
+              throw "Vulkan SDK checksum mismatch. Expected $env:VULKAN_SDK_SHA256, got $sdkHash. Refusing to run an unverified installer."
+            }
+            $sdkRoot = Join-Path $env:RUNNER_TEMP "VulkanSDK"
+            # LunarG ships a Qt-installer; these are its documented unattended switches. 7z can
+            # read the wrapper but not the payload, so there is no lighter extract-one-dll path.
+            & $sdk --root $sdkRoot --accept-licenses --default-answer --confirm-command install | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "The Vulkan SDK installer exited $LASTEXITCODE."
+            }
+            # Bin is the 64-bit loader, Bin32 the 32-bit one. win-x86 needs the latter, and an
+            # x64 loader would load but refuse every 32-bit ICD, so the bitness is chosen here
+            # rather than left to whatever the search order happens to find first.
+            $binDir = if ($arch -eq "x86") { "Bin32" } else { "Bin" }
+            $found = Get-ChildItem -Path $sdkRoot -Recurse -Filter "vulkan-1.dll" -ErrorAction SilentlyContinue |
+              Where-Object { $_.DirectoryName -match [regex]::Escape($binDir) + "$" } |
+              Select-Object -First 1
+            if (-not $found) {
+              throw ("The Vulkan SDK installed but carries no $binDir/vulkan-1.dll, so there is no " +
+                     "$arch loader for the lavapipe ICD and the Vulkan smoke cannot run on " +
+                     "$env:RID. Either supply a $arch loader another way, or drop Vulkan from the " +
+                     "backends proven on this RID the way win-arm64 and osx-* already do - but do " +
+                     "not leave a tier claiming a backend no run has ever exercised.")
+            }
+            Copy-Item $found.FullName (Join-Path $dest "$arch/vulkan-1.dll") -Force
+            Write-Host "Vulkan loader: $($found.FullName) -> $dest/$arch (from LunarG SDK $env:VULKAN_SDK_VERSION)"
+            # Beside the ICD, and first on PATH: the app must load THIS loader, not something a
+            # later toolchain step drops on the machine.
+            "$dest/$arch" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           }
           # VK_DRIVER_FILES restricts the loader to exactly this ICD, so a passing Vulkan smoke here
           # is proof the software driver drew it rather than something else on the machine.
