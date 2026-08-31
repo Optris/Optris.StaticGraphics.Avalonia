@@ -93,9 +93,9 @@ background session. Real hardware, in a GUI session, is required.
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="Avalonia" Version="11.3.14" />
-  <PackageReference Include="Avalonia.Desktop" Version="11.3.14" />
-  <PackageReference Include="Avalonia.Themes.Fluent" Version="11.3.14" />
+  <PackageReference Include="Avalonia" Version="12.1.1" />
+  <PackageReference Include="Avalonia.Desktop" Version="12.1.1" />
+  <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.1" />
   <PackageReference Include="Optris.StaticGraphics.Avalonia.Vulkan" Version="3.119.4.12" />
 </ItemGroup>
 ```
@@ -104,21 +104,37 @@ The first three parts of the package version are the SkiaSharp version it was bu
 fourth is the build revision. It is a release version, not a prerelease - upstream's `3.119.4-7922.1`
 makes every consumer opt into prereleases forever, and every consumer of theirs after that.
 
-Pick the version whose SkiaSharp matches the one your Avalonia version uses:
+The first three parts ARE the SkiaSharp version, and it is not a choice: it must be the SkiaSharp
+that YOUR Avalonia depends on. Avalonia.Skia declares that dependency, and the managed bindings your
+app calls come from it. A package built from a different SkiaSharp major ships native code those
+bindings were not compiled against.
 
-| Avalonia | SkiaSharp | package version |
+| Avalonia | SkiaSharp it depends on | package version to use |
 | --- | --- | --- |
-| 11.3.14 | 2.88.9 | `2.88.9.*` |
-| 11.3.14 | 3.119.4 | `3.119.4.*` |
-| 12.1.0 | 3.119.4 | `3.119.4.*` |
-| 12.1.0 | 4.150.1 | `4.150.1.*` |
+| 12.1.x | 3.119.4 | `3.119.4.*` |
+| 11.3.x | 2.88.9 | not published - see below |
+
+To check for any release: read `id="SkiaSharp"` out of
+`https://api.nuget.org/v3-flatcontainer/avalonia.skia/<version>/avalonia.skia.nuspec`.
+
+**These packages track Avalonia's latest stable major only.** Avalonia maintains several majors at
+once, and each needs its own SkiaSharp and therefore its own build - an older line is not a
+configuration flag, it is a separate release. CI resolves the newest stable major, reads the
+SkiaSharp version off it and compiles that; an explicit SkiaSharp that contradicts the Avalonia
+being targeted is refused rather than reconciled.
+
+That refusal exists because the mismatch is otherwise invisible. This repository shipped it once:
+the smoke ran Avalonia 11.3.14 while the packages carried SkiaSharp 3.119.4, and it rendered anyway
+only because the package's own SkiaSharp reference is higher, so NuGet silently upgraded Avalonia's
+Skia underneath it. Highest-wins does not warn, and the one test meant to prove the native layer
+works had been proving it for a pairing nobody ships.
 
 On macOS also reference `Optris.StaticGraphics.AvaloniaNative`, which carries
 `libAvaloniaNative.a`. It is tier-independent, but it contains Avalonia's own native library, so its
 version has to match the Avalonia version the application uses:
 
 ```xml
-<PackageReference Include="Optris.StaticGraphics.AvaloniaNative" Version="11.3.14.1" />
+<PackageReference Include="Optris.StaticGraphics.AvaloniaNative" Version="12.1.1.1" />
 ```
 
 ## Publish

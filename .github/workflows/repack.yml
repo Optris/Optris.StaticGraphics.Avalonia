@@ -46,7 +46,6 @@ on:
 env:
   DOTNET_VERSION: "10.0.302"
   DOTNET_ALPINE_IMAGE: mcr.microsoft.com/dotnet/sdk:10.0.302-alpine3.23
-  AVALONIA_SMOKE_VERSION: "11.3.14"
 
 jobs:
   repack:
@@ -154,6 +153,7 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
+          import json
           import os
           import pathlib
           import re
@@ -182,6 +182,28 @@ jobs:
           # all - so every branch below stops the run instead of lowering itself to a warning.
           def fail(message):
               sys.exit(f"::error::{message}")
+
+          def _nuget_versions(package_id):
+              url = f"https://api.nuget.org/v3-flatcontainer/{package_id.lower()}/index.json"
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      return json.load(response).get("versions", [])
+              except Exception as error:  # noqa: BLE001
+                  fail(f"Could not list {package_id} versions on nuget.org: {error}")
+
+          def _avalonia_skiasharp(avalonia_version):
+              """The SkiaSharp an Avalonia release depends on, or None if it cannot be read."""
+              url = (
+                  "https://api.nuget.org/v3-flatcontainer/avalonia.skia/"
+                  f"{avalonia_version}/avalonia.skia.nuspec"
+              )
+              try:
+                  with urllib.request.urlopen(url, timeout=30) as response:
+                      nuspec = response.read().decode("utf-8")
+              except Exception:  # noqa: BLE001
+                  return None
+              found = re.search(r'id="SkiaSharp"\s+version="([^"]+)"', nuspec)
+              return found.group(1) if found else None
 
           output = pathlib.Path("External/NativeStatic") / f"static-{tier}"
           record = pathlib.Path("artifacts/source-provenance")
@@ -297,6 +319,40 @@ jobs:
           print(f"  ANGLE branch   : {angle_branch or 'none (tier ships no ANGLE)'}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
               handle.write(f"skiasharp_version={source_skiasharp}\n")
+
+          # Which Avalonia line does this repacked payload belong to? Not a guess and not a
+          # constant: the smoke has to run the Avalonia whose Avalonia.Skia depends on exactly the
+          # SkiaSharp inside this package. A hardcoded 11.3.14 sat here while packages carried
+          # SkiaSharp 3.119.4, which Avalonia 11 does not use - the smoke then proved a pairing no
+          # consumer has, and NuGet hid it by upgrading the loser of the version conflict.
+          avalonia_versions = [
+              version for version in _nuget_versions("Avalonia") if "-" not in version
+          ]
+          if not avalonia_versions:
+              fail("nuget.org returned no stable Avalonia versions.")
+          smoke_avalonia = ""
+          seen = []
+          # Newest first, and only as far as a match: this is a handful of requests, not a scan.
+          for candidate in reversed(avalonia_versions):
+              dependency = _avalonia_skiasharp(candidate)
+              if dependency is None:
+                  continue
+              seen.append(f"{candidate}->{dependency}")
+              if dependency == source_skiasharp:
+                  smoke_avalonia = candidate
+                  break
+              if len(seen) >= 40:
+                  break
+          if not smoke_avalonia:
+              fail(
+                  f"No Avalonia release examined depends on SkiaSharp {source_skiasharp}, so there "
+                  "is no Avalonia this payload can honestly be smoke-tested against. Checked: "
+                  + ", ".join(seen[:10])
+                  + ". Repack a version that some Avalonia line actually uses."
+              )
+          print(f"Smoke will run Avalonia {smoke_avalonia}, which uses SkiaSharp {source_skiasharp}.")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"smoke_avalonia_version={smoke_avalonia}\n")
               handle.write(f"angle_branch={angle_branch}\n")
               handle.write(f"include_macos={include_macos}\n")
               handle.write(f"rids={' '.join(sorted(rids))}\n")
@@ -612,6 +668,71 @@ jobs:
           esac
           echo "$TIER on $RID will be proven with: $backends"
 
+      - name: 🔢 Resolve the Avalonia line this payload belongs to
+        # Derived here rather than hardcoded, and derived in THIS job because the repack job that
+        # read the source package is a different job whose step outputs are not visible from here.
+        # The package version is <skiasharp>.<rev>, so the SkiaSharp inside it is known; the smoke
+        # must then run the Avalonia release that actually depends on that SkiaSharp. A constant
+        # sat here before, and the smoke proved a pairing no consumer has.
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ inputs.target_version || inputs.source_version }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          import urllib.request
+
+          package_version = os.environ["PACKAGE_VERSION"]
+          parts = package_version.split(".")
+          if len(parts) != 4:
+              sys.exit(f"::error::Expected a four-part package version, got {package_version!r}.")
+          skiasharp = ".".join(parts[:3])
+
+          def read(url):
+              with urllib.request.urlopen(url, timeout=30) as response:
+                  return response.read().decode("utf-8")
+
+          try:
+              versions = json.loads(
+                  read("https://api.nuget.org/v3-flatcontainer/avalonia/index.json")
+              )["versions"]
+          except Exception as error:
+              sys.exit(f"::error::Could not list Avalonia versions: {error}")
+
+          match = ""
+          seen = []
+          for candidate in reversed([v for v in versions if "-" not in v]):
+              try:
+                  nuspec = read(
+                      "https://api.nuget.org/v3-flatcontainer/avalonia.skia/"
+                      f"{candidate}/avalonia.skia.nuspec"
+                  )
+              except Exception:
+                  continue
+              found = re.search(r'id="SkiaSharp"\s+version="([^"]+)"', nuspec)
+              if not found:
+                  continue
+              seen.append(f"{candidate}->{found.group(1)}")
+              if found.group(1) == skiasharp:
+                  match = candidate
+                  break
+              if len(seen) >= 40:
+                  break
+
+          if not match:
+              sys.exit(
+                  f"::error::No Avalonia release examined depends on SkiaSharp {skiasharp}, so this "
+                  "payload cannot be honestly smoke-tested against any of them. Checked: "
+                  + ", ".join(seen[:10])
+              )
+
+          print(f"Smoke will run Avalonia {match}, which depends on SkiaSharp {skiasharp}.")
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as handle:
+              handle.write(f"SMOKE_AVALONIA_VERSION={match}\n")
+          PY
       - name: 🔥 Publish single-file smoke app
         if: ${{ !startsWith(matrix.rid, 'linux-musl-') }}
         shell: pwsh
@@ -623,7 +744,7 @@ jobs:
             -NuGetSource (Resolve-Path "artifacts/nuget") `
             -Tier "$env:TIER" `
             -PackageVersion "$env:PACKAGE_VERSION" `
-            -AvaloniaVersion "$env:AVALONIA_SMOKE_VERSION"
+            -AvaloniaVersion "$env:SMOKE_AVALONIA_VERSION"
           dotnet publish (Join-Path $projectDir "OptrisStaticGraphicsSmoke.csproj") `
             -c Release `
             -r "$env:RID" `
@@ -645,7 +766,7 @@ jobs:
             -NuGetSource "/workspace/artifacts/nuget" `
             -Tier "$env:TIER" `
             -PackageVersion "$env:PACKAGE_VERSION" `
-            -AvaloniaVersion "$env:AVALONIA_SMOKE_VERSION"
+            -AvaloniaVersion "$env:SMOKE_AVALONIA_VERSION"
           docker run --rm `
             -v "${{ github.workspace }}:/workspace" `
             -w /workspace `

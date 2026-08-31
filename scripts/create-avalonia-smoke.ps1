@@ -14,7 +14,11 @@ param(
 
     [string]$AvaloniaNativeVersion = "",
 
-    [string]$AvaloniaVersion = "11.3.14",
+    # A local convenience only. Every CI path passes the Avalonia line explicitly, resolved from
+    # the latest stable major, and the SkiaSharp compiled into the packages is read off it. A
+    # default that disagrees with the packages under test is how the smoke came to prove a pairing
+    # no consumer has.
+    [string]$AvaloniaVersion = "12.1.1",
 
     [string]$SkiaSharpVersion = "",
 

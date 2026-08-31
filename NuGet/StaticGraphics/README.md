@@ -31,7 +31,7 @@ For macOS also reference `Optris.StaticGraphics.AvaloniaNative`, which is tier-i
 match your Avalonia version because it contains `libAvaloniaNative.a`.
 
 ```xml
-<PackageReference Include="Optris.StaticGraphics.AvaloniaNative" Version="11.3.14.1" />
+<PackageReference Include="Optris.StaticGraphics.AvaloniaNative" Version="12.1.1.1" />
 ```
 
 ## Publish

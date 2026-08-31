@@ -41,6 +41,14 @@
             and every consumer of a consumer to opt into prereleases forever. The ANGLE branch that
             used to sit in the prerelease label is published as a property instead.
         -->
+        <!-- A LOCAL FALLBACK ONLY. Every CI path passes -p:SkiaSharpVersion, and passes the
+             version read off the Avalonia release being targeted rather than a number chosen
+             here: Avalonia.Skia's dependency is what a consumer's managed bindings will be, and
+             building the native library from a different major than those bindings expect is a
+             mismatch NuGet resolves silently by upgrading the loser. Preflight derives it and
+             refuses any explicit value that disagrees. Left non-empty so a bare `dotnet pack`
+             still works locally; if you rely on this number for anything shipped, that is the
+             bug. -->
         <SkiaSharpVersion Condition="'$(SkiaSharpVersion)' == ''">4.150.1</SkiaSharpVersion>
         <BuildRev Condition="'$(BuildRev)' == ''">1</BuildRev>
         <Version>$(SkiaSharpVersion).$(BuildRev)</Version>

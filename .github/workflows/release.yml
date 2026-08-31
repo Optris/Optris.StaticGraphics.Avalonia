@@ -15,7 +15,9 @@ on:
         default: '["Vulkan","OpenGL","Software"]'
         type: string
       skiasharp_version:
-        description: Override the SkiaSharp version pinned by the packaging project
+        description: >-
+          Assertion, not a pin: if given it must equal the SkiaSharp the chosen Avalonia depends
+          on, and the run is refused otherwise. Normally leave empty and let it be derived.
         required: false
         default: ""
         type: string
@@ -25,7 +27,10 @@ on:
         default: ""
         type: string
       avalonia_version:
-        description: Avalonia version for the AvaloniaNative package; empty uses latest stable
+        description: >-
+          The Avalonia release line this whole build targets. Empty resolves the latest stable
+          MAJOR. SkiaSharp is derived from it - whatever Avalonia.Skia depends on is what gets
+          compiled - so this is the only version knob that matters.
         required: false
         default: ""
         type: string
@@ -91,7 +96,6 @@ concurrency:
 env:
   DOTNET_VERSION: "10.0.302"
   DOTNET_ALPINE_IMAGE: mcr.microsoft.com/dotnet/sdk:10.0.302-alpine3.23
-  AVALONIA_SMOKE_VERSION: "11.3.14"
 
 jobs:
   preflight:
@@ -99,11 +103,16 @@ jobs:
     with:
       tiers: ${{ inputs.tiers || '["Vulkan","OpenGL","Software"]' }}
       skiasharp_version: ${{ inputs.skiasharp_version || '' }}
+      avalonia_version: ${{ inputs.avalonia_version || '' }}
       build_rev: ${{ inputs.build_rev || '' }}
       allow_republish: ${{ inputs.allow_republish || false }}
 
   avalonia:
     name: 🔢 Resolve Avalonia version
+    # Takes the line preflight already resolved rather than asking nuget.org a second time:
+    # two independent resolutions can disagree, and the whole point of this change is that the
+    # Avalonia line and the SkiaSharp built against it cannot drift apart.
+    needs: preflight
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     outputs:
@@ -114,7 +123,7 @@ jobs:
         id: resolve
         shell: bash
         env:
-          REQUESTED_VERSION: ${{ inputs.avalonia_version }}
+          REQUESTED_VERSION: ${{ inputs.avalonia_version || needs.preflight.outputs.avalonia_version }}
         run: |
           set -euo pipefail
           version="${REQUESTED_VERSION:-}"
@@ -682,7 +691,7 @@ jobs:
             -NuGetSource (Resolve-Path "artifacts/nuget") `
             -Tier "$env:TIER" `
             -PackageVersion "$env:PACKAGE_VERSION" `
-            -AvaloniaVersion "$env:AVALONIA_SMOKE_VERSION"
+            -AvaloniaVersion "${{ needs.preflight.outputs.avalonia_version }}"
           dotnet publish (Join-Path $projectDir "OptrisStaticGraphicsSmoke.csproj") `
             -c Release `
             -r "$env:RID" `
@@ -704,7 +713,7 @@ jobs:
             -NuGetSource "/workspace/artifacts/nuget" `
             -Tier "$env:TIER" `
             -PackageVersion "$env:PACKAGE_VERSION" `
-            -AvaloniaVersion "$env:AVALONIA_SMOKE_VERSION"
+            -AvaloniaVersion "${{ needs.preflight.outputs.avalonia_version }}"
           docker run --rm `
             -v "${{ github.workspace }}:/workspace" `
             -w /workspace `

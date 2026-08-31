@@ -26,6 +26,14 @@ on:
         required: false
         default: false
         type: boolean
+      avalonia_version:
+        description: >-
+          Avalonia release line this build is for. Empty resolves the latest stable MAJOR, which is
+          what these packages track. SkiaSharp is then taken from whatever that Avalonia depends on
+          rather than pinned beside it.
+        required: false
+        default: ""
+        type: string
     outputs:
       package_version:
         value: ${{ jobs.validate.outputs.package_version }}
@@ -37,6 +45,8 @@ on:
         value: ${{ jobs.validate.outputs.angle_branch }}
       tiers:
         value: ${{ jobs.validate.outputs.tiers }}
+      avalonia_version:
+        value: ${{ jobs.validate.outputs.avalonia_version }}
   workflow_dispatch:
     inputs:
       tiers:
@@ -56,6 +66,10 @@ on:
         required: false
         default: false
         type: boolean
+      avalonia_version:
+        required: false
+        default: ""
+        type: string
 
 jobs:
   validate:
@@ -68,6 +82,7 @@ jobs:
       build_rev: ${{ steps.versions.outputs.build_rev }}
       angle_branch: ${{ steps.versions.outputs.angle_branch }}
       tiers: ${{ steps.versions.outputs.tiers }}
+      avalonia_version: ${{ steps.versions.outputs.avalonia_version }}
     steps:
       - name: 🛒 Checkout
         uses: actions/checkout@v6
@@ -83,6 +98,7 @@ jobs:
         env:
           INPUT_TIERS: ${{ inputs.tiers }}
           INPUT_SKIASHARP_VERSION: ${{ inputs.skiasharp_version }}
+          INPUT_AVALONIA_VERSION: ${{ inputs.avalonia_version }}
           INPUT_BUILD_REV: ${{ inputs.build_rev }}
         run: |
           python3 - <<'PY'
@@ -92,6 +108,7 @@ jobs:
           import re
           import subprocess
           import sys
+          import urllib.request
 
           def fail(message):
               sys.exit(f"::error::{message}")
@@ -121,7 +138,61 @@ jobs:
               fail(f"dotnet msbuild -getProperty returned no JSON:\n{result.stdout}")
           properties = json.loads(result.stdout[start:]).get("Properties", {})
 
-          skiasharp_version = os.environ.get("INPUT_SKIASHARP_VERSION") or properties.get("SkiaSharpVersion", "")
+          # Which Avalonia line is this package FOR, and therefore which SkiaSharp must it carry?
+          # These two were pinned independently, and drifted: the packaging project said SkiaSharp
+          # 3.119.4 while the smoke ran Avalonia 11.3.14, which depends on SkiaSharp 2.88.9. It
+          # rendered anyway only because our own PackageReference on 3.119.4 is higher, so NuGet
+          # silently upgraded Avalonia 11's Skia underneath it - a major native version, swapped
+          # without a word, in the one test meant to prove the native layer works.
+          # So SkiaSharp is no longer a number a human keeps in step. It is READ OFF the Avalonia
+          # release line, which makes the two incapable of disagreeing.
+          def http_json(url):
+              with urllib.request.urlopen(url, timeout=60) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          avalonia_version = os.environ.get("INPUT_AVALONIA_VERSION", "").strip()
+          if not avalonia_version:
+              # Latest stable MAJOR. Avalonia maintains several majors at once and these packages
+              # follow the newest; an older line needs its own SkiaSharp and so its own build.
+              try:
+                  versions = http_json("https://api.nuget.org/v3-flatcontainer/avalonia/index.json")["versions"]
+              except Exception as error:
+                  fail(f"Could not list Avalonia versions from nuget.org: {error}")
+              stable = [v for v in versions if "-" not in v]
+              if not stable:
+                  fail("nuget.org returned no stable Avalonia versions.")
+              newest_major = max(int(v.split(".")[0]) for v in stable)
+              avalonia_version = [v for v in stable if int(v.split(".")[0]) == newest_major][-1]
+
+          # Avalonia.Skia is where the SkiaSharp dependency is declared.
+          nuspec_url = (
+              "https://api.nuget.org/v3-flatcontainer/avalonia.skia/"
+              f"{avalonia_version}/avalonia.skia.nuspec"
+          )
+          try:
+              with urllib.request.urlopen(nuspec_url, timeout=60) as response:
+                  nuspec = response.read().decode("utf-8")
+          except Exception as error:
+              fail(f"Could not read {nuspec_url}: {error}. Is {avalonia_version} a real Avalonia release?")
+          found = re.search(r'id="SkiaSharp"\s+version="([^"]+)"', nuspec)
+          if not found:
+              fail(
+                  f"Avalonia.Skia {avalonia_version} declares no SkiaSharp dependency, so there is "
+                  "nothing to build these packages against. Refusing to guess one."
+              )
+          required_skiasharp = found.group(1)
+
+          pinned = os.environ.get("INPUT_SKIASHARP_VERSION", "").strip()
+          if pinned and pinned != required_skiasharp:
+              fail(
+                  f"SkiaSharp {pinned} was requested, but Avalonia {avalonia_version} depends on "
+                  f"SkiaSharp {required_skiasharp}. Shipping the mismatch is how a consumer ends up "
+                  "with managed bindings calling a native library they were not built for - and "
+                  "NuGet will hide it, because highest-wins silently upgrades the loser. Build the "
+                  "Avalonia line that wants this SkiaSharp, or drop the pin."
+              )
+          skiasharp_version = required_skiasharp
+          print(f"Avalonia {avalonia_version} requires SkiaSharp {skiasharp_version}; building that.")
           build_rev = os.environ.get("INPUT_BUILD_REV") or properties.get("BuildRev", "")
           angle_branch = properties.get("OptrisStaticGraphicsAngleBranch", "")
 
@@ -158,6 +229,9 @@ jobs:
               "build_rev": build_rev,
               "angle_branch": angle_branch,
               "tiers": json.dumps(tiers),
+              # Emitted so the smoke builds against the SAME Avalonia this SkiaSharp came from.
+              # Reading it back out of the step summary is how the drift stayed invisible before.
+              "avalonia_version": avalonia_version,
           }
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
               for key, value in outputs.items():
