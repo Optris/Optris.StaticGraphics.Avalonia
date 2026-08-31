@@ -617,11 +617,22 @@ jobs:
           # against renderer 'Apple M4 Pro'. CI cannot reproduce that, so it does not pretend to.
           #
           # Both are written up in README.md under "Known gap: Metal on macOS", with the
-          # measurements and the reproduction. win-arm64 drops Vulkan for a simpler and unrelated
-          # reason: lavapipe publishes no arm64 Windows build, so there is no software ICD there.
+          # measurements and the reproduction.
+          #
+          # The two Windows drops are about the software driver, not the package, and both are
+          # measured rather than assumed:
+          #   win-arm64 - lavapipe publishes no arm64 Windows build at all, so there is no
+          #     software ICD to render with.
+          #   win-x86   - the 32-bit lavapipe CRASHES. The smoke exits 139 on the runner, and the
+          #     same crash reproduces on a developer machine as 0xC0000005, non-elevated, with the
+          #     system loader, so it is not a CI artifact. It is Mesa's 32-bit build: the very
+          #     same win-x86 package renders Vulkan correctly against a real GPU driver
+          #     ("PASS tier=Vulkan requested-backend=Vulkan observed=Vulkan"). We cannot prove
+          #     Vulkan on win-x86 with a driver that faults, and will not claim it on one.
+          # win-x64 IS proven - it renders through lavapipe here - and that is the flagship case.
           case "$RID" in
-            osx-*)     backends="$(printf '%s\n' $backends | grep -vxE 'Vulkan|OpenGL' | tr '\n' ' ' || true)" ;;
-            win-arm64) backends="$(printf '%s\n' $backends | grep -vx Vulkan | tr '\n' ' ' || true)" ;;
+            osx-*)              backends="$(printf '%s\n' $backends | grep -vxE 'Vulkan|OpenGL' | tr '\n' ' ' || true)" ;;
+            win-arm64|win-x86)  backends="$(printf '%s\n' $backends | grep -vx Vulkan | tr '\n' ' ' || true)" ;;
           esac
 
           # GLX needs an X server that offers the extension AND a GL implementation behind it.
@@ -754,7 +765,9 @@ jobs:
       # Linux gets the same driver from apt (mesa-vulkan-drivers) and needs no download.
       # No arm64 build exists, which is why win-arm64 is excluded from the smoke step below.
       - name: 🌋 Install lavapipe (software Vulkan)
-        if: ${{ startsWith(matrix.rid, 'win-') && matrix.rid != 'win-arm64' && matrix.tier == 'Vulkan' }}
+        # Only where a Vulkan backend is actually proven: win-arm64 has no lavapipe build and
+        # win-x86's crashes, so neither asks for Vulkan above and neither needs a driver.
+        if: ${{ startsWith(matrix.rid, 'win-') && matrix.rid != 'win-arm64' && matrix.rid != 'win-x86' && matrix.tier == 'Vulkan' }}
         shell: pwsh
         env:
           MESA_URL: https://github.com/pal1000/mesa-dist-win/releases/download/26.1.7/mesa3d-26.1.7-release-msvc.7z
