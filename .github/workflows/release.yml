@@ -875,6 +875,14 @@ jobs:
             }
             "$dest/$arch" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           }
+          # Loader diagnostics, on for these legs only. Avalonia reports every Vulkan failure as
+          # "RenderingMode has a value of Vulkan, but no options were applied" - the symptom, never
+          # the cause - and three rounds of fixing this were spent inferring a cause from that one
+          # sentence. The loader itself will say which ICD it found, which it rejected and why, so
+          # let it: if the next failure is still a mystery, the mystery is in the log rather than
+          # in a guess.
+          "VK_LOADER_DEBUG=warn,error,info" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
           # VK_DRIVER_FILES restricts the loader to exactly this ICD, so a passing Vulkan smoke here
           # is proof the software driver drew it rather than something else on the machine.
           "VK_DRIVER_FILES=$icd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
