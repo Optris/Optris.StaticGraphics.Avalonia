@@ -7,13 +7,19 @@ name: 🔭 Avalonia watch
 # different major than those bindings expect is exactly the mismatch that reached us once
 # already. Under the current design preflight would refuse such a build outright.
 #
-# So the question is "has Avalonia's newest MAJOR moved past what we have published", and the
+# So the question is "has Avalonia's newest MAJOR moved past what we last VALIDATED", and the
 # SkiaSharp version is read off that Avalonia rather than chosen beside it.
 #
-# The comparison stays between two facts that cannot drift: what is on nuget.org upstream, and
-# what we have actually published. Anything derived from repo state - a marker file, a pinned
-# property, the last tag - can be edited or reverted, and would then either miss a release or
-# rebuild for ever.
+# Validated, not published, and the difference matters: most Avalonia patches keep the same
+# SkiaSharp, so a published-version comparison would skip them and we would be claiming
+# compatibility with releases nothing had ever rendered a frame against. The payload is genuinely
+# unchanged in that case; what changed is how Avalonia CALLS it.
+#
+# The record of what was validated is the NAME of an artifact written by the last successful run.
+# Deliberately not repo state - a marker file can be edited or reverted, which would either miss a
+# release or rebuild for ever - and deliberately not downloaded, since the name carries the whole
+# answer. An expired or missing marker reads as "not validated", so the failure direction is a
+# redundant build rather than a silent skip.
 
 on:
   schedule:
@@ -49,6 +55,8 @@ jobs:
       - name: 🔭 Compare upstream against what we shipped
         id: check
         shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
           python3 - <<'PY'
           import json
@@ -57,6 +65,17 @@ jobs:
           import sys
           import urllib.error
           import urllib.request
+
+          # One place the marker naming lives, since the record job below has to match it.
+          MARKER_PREFIX = "validated-avalonia-"
+
+          def http_json(url, token=""):
+              request = urllib.request.Request(url)
+              if token:
+                  request.add_header("Authorization", f"Bearer {token}")
+                  request.add_header("Accept", "application/vnd.github+json")
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
 
           def versions(package_id):
               url = f"https://api.nuget.org/v3-flatcontainer/{package_id.lower()}/index.json"
@@ -96,8 +115,38 @@ jobs:
               )
           skiasharp = found.group(1)
 
-          # Our package version is <skiasharp>.<rev>, so "have we shipped for this Avalonia" is
-          # answered by whether we have shipped for the SkiaSharp it needs.
+          # The trigger is a new AVALONIA, not a new SkiaSharp. Most Avalonia patches keep the same
+          # SkiaSharp, so keying on SkiaSharp would skip them - and we would then be claiming
+          # compatibility with an Avalonia release no run had ever rendered a frame against. The
+          # payload really is unchanged in that case, but what changed is how Avalonia CALLS it,
+          # which is exactly what a smoke test is for.
+          #
+          # "What did we last validate" is recorded in the NAME of an artifact from the last
+          # successful validation, so nothing has to be downloaded and no repo state is involved -
+          # a marker file can be edited or reverted, which is why the original watch refused one.
+          # If the artifact has expired or was never written, that reads as "not validated" and we
+          # build. Erring towards a rebuild is the safe direction here.
+          validated = ""
+          try:
+              listing = http_json(
+                  "https://api.github.com/repos/"
+                  f"{os.environ['GITHUB_REPOSITORY']}/actions/artifacts?per_page=100",
+                  token=os.environ.get("GITHUB_TOKEN", ""),
+              )
+              candidates = [
+                  artifact for artifact in listing.get("artifacts", [])
+                  if artifact.get("name", "").startswith(MARKER_PREFIX) and not artifact.get("expired")
+              ]
+              if candidates:
+                  candidates.sort(key=lambda artifact: artifact.get("created_at", ""))
+                  validated = candidates[-1]["name"][len(MARKER_PREFIX):]
+          except Exception as error:  # noqa: BLE001
+              # A read failure must not be mistaken for "already validated".
+              print(f"::warning::Could not read validation markers ({error}); assuming none.")
+
+          # The revision only matters when a build actually produces a new package, and this watch
+          # never publishes. Keep it derived from what is on nuget.org so the summary suggests a
+          # sane next version.
           shipped = versions("Optris.StaticGraphics.Avalonia.Vulkan")
           matching = [version for version in shipped if version.startswith(f"{skiasharp}.")]
           revisions = []
@@ -105,9 +154,9 @@ jobs:
               parts = version.split(".")
               if len(parts) == 4 and parts[3].isdigit():
                   revisions.append(int(parts[3]))
-
-          should_build = not matching
           build_rev = (max(revisions) + 1) if revisions else 1
+
+          should_build = validated != avalonia
 
           outputs = {
               "avalonia_version": avalonia,
@@ -124,11 +173,16 @@ jobs:
                   f"Latest stable Avalonia major: **{avalonia}**, which depends on SkiaSharp "
                   f"**{skiasharp}**.\n\n"
               )
-              if matching:
-                  handle.write(f"Already shipped as: {', '.join(matching)}. Nothing to do.\n")
+              if not should_build:
+                  handle.write(
+                      f"Avalonia **{avalonia}** was already validated, and nothing upstream has "
+                      "moved since. Nothing to do.\n"
+                  )
               else:
                   handle.write(
-                      f"Not shipped yet. Starting a validation build for **{skiasharp}.{build_rev}**.\n\n"
+                      f"Avalonia **{avalonia}** has not been validated"
+                      + (f" (last validated: {validated})" if validated else " (no previous marker)")
+                      + f". Starting a validation build against SkiaSharp **{skiasharp}**.\n\n"
                       "To release it: set `BuildRev` to "
                       f"`{build_rev}` in the packaging project and review "
                       "`OptrisStaticGraphicsAngleBranch`, which usually moves with a new Skia, then "
@@ -158,3 +212,39 @@ jobs:
       publish_to_release: false
       allow_republish: false
     secrets: inherit
+
+  record:
+    name: 🔖 Record what was validated
+    needs: [check, build]
+    # Only a genuinely green validation counts. A failed or cancelled build must leave the marker
+    # untouched, so the next run tries again rather than inheriting a pass it never earned.
+    if: ${{ needs.build.result == 'success' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: 🔖 Write the marker
+        shell: bash
+        env:
+          AVALONIA_VERSION: ${{ needs.check.outputs.avalonia_version }}
+        run: |
+          set -euo pipefail
+          mkdir -p marker
+          # The NAME carries the version; the content is only here because an artifact needs a
+          # file. That is deliberate - the next run reads the name from the artifacts API and
+          # never downloads anything.
+          {
+            echo "Avalonia $AVALONIA_VERSION passed a full validation build."
+            echo "Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } > marker/validated.txt
+
+      - name: 📤 Upload the marker
+        uses: actions/upload-artifact@v7
+        with:
+          name: validated-avalonia-${{ needs.check.outputs.avalonia_version }}
+          path: marker/validated.txt
+          if-no-files-found: error
+          # Long enough that a quiet period upstream does not silently expire into a rebuild loop,
+          # and short enough that the list the check job reads stays small.
+          retention-days: 90
