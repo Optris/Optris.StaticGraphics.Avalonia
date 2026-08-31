@@ -856,9 +856,23 @@ jobs:
                      "way win-arm64 and osx-* already do - but do not leave a tier claiming a " +
                      "backend no run has ever exercised.")
             }
+            # NEXT TO THE APP, not merely on PATH. The first attempt put the loader's directory on
+            # GITHUB_PATH and the smoke still failed with Avalonia's "RenderingMode has a value of
+            # Vulkan, but no options were applied" - the loader was built, found and copied, and
+            # the app never used it. Reproduced locally on Windows: this exact loader, built from
+            # the same pinned commit, drives lavapipe and renders when it sits BESIDE the
+            # executable. The application directory is the first entry in Windows' DLL search
+            # order and does not depend on how .NET chooses to resolve a bare library name, which
+            # PATH does. Belt and braces: the directory stays on PATH too, but the copy beside the
+            # app is what makes it deterministic.
+            $appDir = Join-Path $PWD "artifacts/smoke-$env:TIER-$env:RID"
             Copy-Item $found.FullName (Join-Path $dest "$arch/vulkan-1.dll") -Force
-            Write-Host "Vulkan loader: built from Vulkan-Loader $env:VULKAN_TAG ($loaderSha) -> $dest/$arch"
-            # Beside the ICD and first on PATH, so the app loads THIS one.
+            if (Test-Path $appDir) {
+              Copy-Item $found.FullName (Join-Path $appDir "vulkan-1.dll") -Force
+              Write-Host "Vulkan loader: built from Vulkan-Loader $env:VULKAN_TAG ($loaderSha) -> $appDir (beside the app)"
+            } else {
+              throw "Expected the published smoke app at $appDir so the Vulkan loader could be placed beside it, and it is not there."
+            }
             "$dest/$arch" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
           }
           # VK_DRIVER_FILES restricts the loader to exactly this ICD, so a passing Vulkan smoke here
