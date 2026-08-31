@@ -213,6 +213,28 @@ each tier, runs the smoke tests, and only then publishes. The platform workflows
 (`static-graphics-windows.yml`, `-linux`, `-musl`, `-macos`) can be dispatched on their own when
 diagnosing one platform.
 
+### When Avalonia releases
+
+`avalonia-watch.yml` polls nuget.org daily for the newest stable Avalonia **major**, reads the
+SkiaSharp version out of that release's `Avalonia.Skia` nuspec, and starts a full validation build if
+that Avalonia has not passed one yet. It never publishes.
+
+The trigger is the Avalonia version, not the SkiaSharp version, and that is deliberate. Most Avalonia
+patches keep the same SkiaSharp, so keying on SkiaSharp would skip them - and the packages would then
+be claiming compatibility with an Avalonia release nothing had ever rendered a frame against. The
+native payload really is unchanged in that case; what changes is how Avalonia calls it, which is
+exactly what the smoke tests check. So 12.1.2 costs a rebuild that produces near-identical archives,
+and buys the right to say it was tested.
+
+What has been validated is recorded as the *name* of an artifact, `validated-avalonia-<version>`,
+written only by a green build. Not a file in the repo, which could be edited or reverted; not a
+published version, which would answer the wrong question. If that lookup fails or the artifact has
+expired, the run rebuilds rather than assuming a pass.
+
+Releasing is still a human step: set `BuildRev`, review `OptrisStaticGraphicsAngleBranch`, and push a
+`v<skiasharp>.<rev>` tag. `SkiaSharpVersion` needs no edit - preflight derives it from Avalonia, and
+refuses a build where an explicitly pinned SkiaSharp disagrees with the Avalonia being targeted.
+
 ## Credit
 
 The build scripts, the ANGLE patch and the MSBuild integration began as
