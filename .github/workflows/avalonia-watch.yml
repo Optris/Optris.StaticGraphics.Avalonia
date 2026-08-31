@@ -15,8 +15,8 @@ name: 🔭 Avalonia watch
 # compatibility with releases nothing had ever rendered a frame against. The payload is genuinely
 # unchanged in that case; what changed is how Avalonia CALLS it.
 #
-# The record of what was validated is the NAME of an artifact written by the last successful run.
-# Deliberately not repo state - a marker file can be edited or reverted, which would either miss a
+# The record of what was validated is the NAME of an artifact written by the last successful run,
+# looked up by exact name. Deliberately not repo state - a marker file can be edited or reverted, which would either miss a
 # release or rebuild for ever - and deliberately not downloaded, since the name carries the whole
 # answer. An expired or missing marker reads as "not validated", so the failure direction is a
 # redundant build rather than a silent skip.
@@ -64,6 +64,7 @@ jobs:
           import re
           import sys
           import urllib.error
+          import urllib.parse
           import urllib.request
 
           # One place the marker naming lives, since the record job below has to match it.
@@ -121,28 +122,34 @@ jobs:
           # payload really is unchanged in that case, but what changed is how Avalonia CALLS it,
           # which is exactly what a smoke test is for.
           #
-          # "What did we last validate" is recorded in the NAME of an artifact from the last
-          # successful validation, so nothing has to be downloaded and no repo state is involved -
-          # a marker file can be edited or reverted, which is why the original watch refused one.
-          # If the artifact has expired or was never written, that reads as "not validated" and we
-          # build. Erring towards a rebuild is the safe direction here.
-          validated = ""
+          # "Did we validate THIS Avalonia" is recorded in the NAME of an artifact written by the
+          # last successful validation, so nothing has to be downloaded and no repo state is
+          # involved - a marker file can be edited or reverted, which is why the original watch
+          # refused one.
+          #
+          # Asked as an exact-name query rather than by paging the repository artifact list. That
+          # list is capped and ordered by creation, so a scan would depend on the marker still
+          # sitting inside the newest N - true today only because nothing uploads after the record
+          # job. Add artifacts to a run and the marker slides out of the window, which reads as
+          # "not validated" and rebuilds nightly for ever. A filtered query has no window.
+          #
+          # An expired, missing or unreadable marker reads as "not validated" and we build. Erring
+          # towards a redundant build rather than a silent skip is the whole point.
+          marker = f"{MARKER_PREFIX}{avalonia}"
+          validated = False
           try:
               listing = http_json(
                   "https://api.github.com/repos/"
-                  f"{os.environ['GITHUB_REPOSITORY']}/actions/artifacts?per_page=100",
+                  f"{os.environ['GITHUB_REPOSITORY']}/actions/artifacts"
+                  f"?name={urllib.parse.quote(marker)}&per_page=100",
                   token=os.environ.get("GITHUB_TOKEN", ""),
               )
-              candidates = [
-                  artifact for artifact in listing.get("artifacts", [])
-                  if artifact.get("name", "").startswith(MARKER_PREFIX) and not artifact.get("expired")
-              ]
-              if candidates:
-                  candidates.sort(key=lambda artifact: artifact.get("created_at", ""))
-                  validated = candidates[-1]["name"][len(MARKER_PREFIX):]
+              validated = any(
+                  not artifact.get("expired") for artifact in listing.get("artifacts", [])
+              )
           except Exception as error:  # noqa: BLE001
               # A read failure must not be mistaken for "already validated".
-              print(f"::warning::Could not read validation markers ({error}); assuming none.")
+              print(f"::warning::Could not read the validation marker ({error}); assuming none.")
 
           # The revision only matters when a build actually produces a new package, and this watch
           # never publishes. Keep it derived from what is on nuget.org so the summary suggests a
@@ -156,7 +163,7 @@ jobs:
                   revisions.append(int(parts[3]))
           build_rev = (max(revisions) + 1) if revisions else 1
 
-          should_build = validated != avalonia
+          should_build = not validated
 
           outputs = {
               "avalonia_version": avalonia,
@@ -180,9 +187,8 @@ jobs:
                   )
               else:
                   handle.write(
-                      f"Avalonia **{avalonia}** has not been validated"
-                      + (f" (last validated: {validated})" if validated else " (no previous marker)")
-                      + f". Starting a validation build against SkiaSharp **{skiasharp}**.\n\n"
+                      f"No `{marker}` marker, so Avalonia **{avalonia}** has never passed a "
+                      f"validation build. Starting one against SkiaSharp **{skiasharp}**.\n\n"
                       "To release it: set `BuildRev` to "
                       f"`{build_rev}` in the packaging project and review "
                       "`OptrisStaticGraphicsAngleBranch`, which usually moves with a new Skia, then "
