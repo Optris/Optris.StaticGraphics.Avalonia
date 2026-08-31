@@ -883,10 +883,37 @@ jobs:
           # in a guess.
           "VK_LOADER_DEBUG=warn,error,info" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-          # VK_DRIVER_FILES restricts the loader to exactly this ICD, so a passing Vulkan smoke here
-          # is proof the software driver drew it rather than something else on the machine.
+          # REGISTERED IN THE REGISTRY, not just pointed at by VK_DRIVER_FILES, and the loader
+          # explained why itself once asked:
+          #   Loader is running with elevated permissions.
+          #   Environment variable VK_DRIVER_FILES will be ignored
+          # GitHub's Windows runners run elevated, and the loader deliberately discards
+          # driver-path environment variables in that case - it is a privilege-escalation guard,
+          # since those variables would otherwise let an unprivileged user inject a DLL into an
+          # elevated process. So lavapipe was never consulted: the loader fell back to the
+          # registry, found only the VM's display adapter, and reported no Vulkan device. Avalonia
+          # surfaced that as "RenderingMode has a value of Vulkan, but no options were applied",
+          # which is why three rounds of guessing never reached it. It also explains why the same
+          # binary, ICD and loader all passed on a developer machine: an ordinary shell is not
+          # elevated, so the variable was honoured there.
+          # HKLM\SOFTWARE\Khronos\Vulkan\Drivers is what an elevated loader reads. The 32-bit
+          # loader reads the WOW6432Node view, so win-x86 has to be registered there instead - an
+          # x64-only registration would leave that leg with no driver at all.
+          $driverKey = if ($arch -eq "x86") {
+            "HKLM:\SOFTWARE\WOW6432Node\Khronos\Vulkan\Drivers"
+          } else {
+            "HKLM:\SOFTWARE\Khronos\Vulkan\Drivers"
+          }
+          New-Item -Path $driverKey -Force | Out-Null
+          # The loader takes the JSON path as the value NAME; the data is a DWORD 0 meaning
+          # "enabled". Registering only this one keeps the guarantee VK_DRIVER_FILES was there
+          # for: a passing Vulkan smoke proves the software driver drew it.
+          New-ItemProperty -Path $driverKey -Name $icd -PropertyType DWord -Value 0 -Force | Out-Null
+          Write-Host "lavapipe ICD registered under $driverKey : $icd"
+
+          # Kept as well: harmless when the loader ignores it, and honoured on any non-elevated
+          # machine, which is where someone reproducing this by hand will be.
           "VK_DRIVER_FILES=$icd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
-          Write-Host "lavapipe ICD: $icd"
 
       # Windows, Linux and macOS all run the same script, so one check covers three platforms. The
       # app's exit code is the whole verdict: there is deliberately no "it was still running, so it
