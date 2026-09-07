@@ -203,10 +203,23 @@ jobs:
     if: ${{ needs.check.outputs.should_build == 'true' && inputs.dry_run != true }}
     # Calling the release workflow instead of dispatching it keeps everything in one run and
     # sidesteps the question of whether GITHUB_TOKEN may start another workflow.
-    # A called workflow can never hold more permission than its caller, so grant what the
-    # release job declares even though this run never reaches it.
+    #
+    # A called workflow's jobs can never hold more permission than the calling job, and GitHub
+    # checks that when it LOADS the workflow - before any job runs, and regardless of whether the
+    # job needing the permission would actually execute. So this has to grant the union of every
+    # permission any job in release.yml declares, not just the ones this run will reach:
+    #   contents: write   the release job
+    #   id-token: write   publish-nuget, for the NuGet Trusted Publishing OIDC exchange
+    # Getting that union wrong does not fail a job - it fails the whole run at startup, with no
+    # jobs, no logs and a generic "workflow file issue". That is exactly how this watch managed to
+    # fail every night from the day it was written without anyone noticing.
+    #
+    # Granting id-token here does NOT make a nightly publish possible: publish-nuget is gated on
+    # `startsWith(github.ref, 'refs/tags/v') || inputs.publish_to_nuget == true`, and this call
+    # passes publish_to_nuget: false from a schedule that never runs on a tag.
     permissions:
       contents: write
+      id-token: write
     uses: ./.github/workflows/release.yml
     with:
       # The Avalonia line is passed, not the SkiaSharp version: preflight derives that, and
