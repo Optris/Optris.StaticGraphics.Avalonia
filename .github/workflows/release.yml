@@ -263,9 +263,24 @@ jobs:
         run: |
           set -euo pipefail
           root="External/NativeStatic/static-$TIER"
-          for dir in "$root"/native-static-"$TIER"-*; do
+
+          # nullglob + an explicit count, because an unmatched glob otherwise iterates ONCE with
+          # the literal pattern as its value: rid becomes "*", the rm and mv operate on a path
+          # nothing will ever be at, and the loop reads exactly like it did the work. This file
+          # has been bitten by that shape before. Fail loudly instead.
+          shopt -s nullglob
+          payloads=("$root"/native-static-"$TIER"-*)
+          if [ ${#payloads[@]} -eq 0 ]; then
+            echo "::error::No native-static-$TIER-* payload directories under $root - the platform"
+            echo "::error::build artifacts did not download, so there is nothing to assemble."
+            exit 1
+          fi
+
+          for dir in "${payloads[@]}"; do
             rid="${dir##*/native-static-$TIER-}"
-            rm -rf "$root/$rid"
+            # :? on both, so a future edit that leaves either empty aborts rather than widening
+            # the rm to the tier root.
+            rm -rf "${root:?}/${rid:?}"
             mv "$dir" "$root/$rid"
           done
 

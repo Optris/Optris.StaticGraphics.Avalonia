@@ -40,7 +40,13 @@ jobs:
       - name: 🔎 actionlint
         uses: docker://rhysd/actionlint:1.7.12
         with:
-          args: -color
+          # shellcheck's info and style levels are ignored, its error and warning levels are NOT.
+          # The distinction is deliberate: warning-level found a real one here (an rm whose path
+          # came from a glob that could match nothing), while the info/style findings are all
+          # quoting preferences inside deliberately-written scripts - several of them in python
+          # heredocs where the "fix" would be wrong. A lint that fails on twelve pre-existing nits
+          # gets switched off or ignored, which is the failure this whole job exists to prevent.
+          args: -color -ignore "SC[0-9]+:(info|style):"
 
       # Catches the class actionlint does NOT model - verified by reintroducing the original defect
       # and watching actionlint pass while this fails.
