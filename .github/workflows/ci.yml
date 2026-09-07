@@ -15,5 +15,37 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The workflows themselves, checked before anything they would build.
+  #
+  # This exists because of a failure that produced NOTHING to debug. The nightly watch called
+  # release.yml while granting less permission than one of release.yml's jobs declares, and GitHub
+  # rejects that when it LOADS the workflow - so every scheduled run ended in startup_failure with
+  # zero jobs, no logs and a generic "workflow file issue". It did that every night from the day it
+  # was written, and its predecessor did the same before it. Nobody had a log to read, because
+  # there was never a log.
+  #
+  # Both checks run on every push, and both are seconds, because the thing they protect against is
+  # measured in weeks of silence rather than minutes of CI.
+  workflows:
+    name: 🔎 Workflow lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+
+      # Catches the ordinary classes: unknown keys, bad expressions, shellcheck over run: blocks,
+      # actions pinned to tags that do not exist.
+      - name: 🔎 actionlint
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
+
+      # Catches the class actionlint does NOT model - verified by reintroducing the original defect
+      # and watching actionlint pass while this fails.
+      - name: 🔐 Reusable-workflow permissions
+        run: python3 scripts/check-workflow-permissions.py
+
   preflight:
     uses: ./.github/workflows/static-graphics-preflight.yml

@@ -4,8 +4,23 @@ name: 🍏 AvaloniaNative
 # waiting for a graphics release. The release workflow packs it too, from the same build.
 
 on:
-  schedule:
-    - cron: "17 3 * * *"
+  # THE NIGHTLY SCHEDULE IS DELIBERATELY OFF. Re-enable it in the same commit that fixes macOS.
+  #
+  # This workflow works. It builds, packs, and then its smoke correctly refuses to publish, because
+  # the macOS payload genuinely does not render: Skia is built with SK_ONLY_VULKAN, so Avalonia
+  # creates an OpenGL device, Skia hands back no GrContext, and the window paints nothing without
+  # raising an error. That is the "Known gap: Metal on macOS" in the README, and it is deferred on
+  # purpose - no product here ships macOS.
+  #
+  # So the nightly run had exactly one possible outcome: red. Twelve consecutive nights of it, and
+  # that is not free. A permanently red Actions tab is how a REAL failure hides - the Avalonia
+  # watch was failing to start every single night over the same period and nobody saw it, because
+  # there was already nothing to see but red. A check that cannot pass is not a check; it is
+  # camouflage.
+  #
+  # Dispatch it by hand whenever the macOS work is picked up again.
+  # schedule:
+  #   - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
       avalonia_version:
