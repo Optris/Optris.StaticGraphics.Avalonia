@@ -20,17 +20,33 @@ name: 🔭 Avalonia watch
 # release or rebuild for ever - and deliberately not downloaded, since the name carries the whole
 # answer. An expired or missing marker reads as "not validated", so the failure direction is a
 # redundant build rather than a silent skip.
+#
+# Once a week the watch also rebuilds what it has already validated, as a canary. Everything the
+# build depends on besides Avalonia - depot_tools, runner images, Xcode and MSVC, brew, choco and
+# apt - moves on its own schedule, and a watch that builds only when Avalonia moves notices none
+# of it until a release needs validating. That is not hypothetical: a depot_tools change on
+# 7 September 2026 broke every macOS and Windows Skia build, and nobody found out until 12.1.3
+# needed validating on the 23rd. A rebuild of an unchanged Avalonia can only fail because the
+# environment moved, and it says so within a week, while there is time, instead of on the
+# morning it matters.
 
 on:
   schedule:
     # Avalonia ships more often than SkiaSharp but still in weeks, not hours, so daily polling
     # costs one ~15 second job and bounds the delay at 24 hours. Note GitHub disables cron on
-    # repos idle for 60 days.
+    # repos idle for 60 days. On Mondays the same run is also the weekly canary (CANARY_WEEKDAY
+    # below) - one cron, so there is no second schedule string for the check to fall out of step
+    # with.
     - cron: "23 5 * * *"
   workflow_dispatch:
     inputs:
       dry_run:
         description: Report what would happen without starting a build
+        required: false
+        default: false
+        type: boolean
+      revalidate:
+        description: Rebuild even if this Avalonia was already validated, as the weekly canary does
         required: false
         default: false
         type: boolean
@@ -57,8 +73,11 @@ jobs:
         shell: bash
         env:
           GITHUB_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          REVALIDATE: ${{ inputs.revalidate }}
         run: |
           python3 - <<'PY'
+          import datetime
           import json
           import os
           import re
@@ -163,7 +182,16 @@ jobs:
                   revisions.append(int(parts[3]))
           build_rev = (max(revisions) + 1) if revisions else 1
 
-          should_build = not validated
+          # The weekly canary: see the top of this file. A scheduled run is at most delayed, never
+          # moved to another day, so the weekday it runs on is the weekday it was scheduled for.
+          CANARY_WEEKDAY = 0  # Monday
+          canary = (
+              os.environ["EVENT_NAME"] == "schedule"
+              and datetime.datetime.now(datetime.timezone.utc).weekday() == CANARY_WEEKDAY
+          )
+          revalidate = os.environ.get("REVALIDATE") == "true"
+
+          should_build = not validated or canary or revalidate
 
           outputs = {
               "avalonia_version": avalonia,
@@ -184,6 +212,14 @@ jobs:
                   handle.write(
                       f"Avalonia **{avalonia}** was already validated, and nothing upstream has "
                       "moved since. Nothing to do.\n"
+                  )
+              elif validated:
+                  why = "the weekly canary" if canary else "a manual revalidation"
+                  handle.write(
+                      f"Avalonia **{avalonia}** was already validated; rebuilding it anyway for "
+                      f"{why}. Avalonia has not changed, so if this fails, the build environment "
+                      "did - depot_tools, a runner image, a toolchain or a package - and the next "
+                      "Avalonia release would have failed the same way.\n"
                   )
               else:
                   handle.write(
@@ -265,5 +301,8 @@ jobs:
           path: marker/validated.txt
           if-no-files-found: error
           # Long enough that a quiet period upstream does not silently expire into a rebuild loop,
-          # and short enough that the list the check job reads stays small.
+          # and short enough that the list the check job reads stays small. The weekly canary
+          # records again on every green run, so a marker only lapses after ninety days of red
+          # canaries - when rebuilding is the right answer anyway - and the exact-name query the
+          # check job makes still sees at most one entry per week.
           retention-days: 90

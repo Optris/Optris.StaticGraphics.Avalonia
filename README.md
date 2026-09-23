@@ -232,6 +232,12 @@ written only by a green build. Not a file in the repo, which could be edited or 
 published version, which would answer the wrong question. If that lookup fails or the artifact has
 expired, the run rebuilds rather than assuming a pass.
 
+On Mondays the same run also rebuilds the Avalonia it has already validated, as a canary. Everything
+the build depends on besides Avalonia - runner images, Xcode and MSVC, brew, choco and apt packages,
+depot_tools for ANGLE - changes on its own schedule, and a watch that builds only when Avalonia moves
+notices none of it until a release needs validating. Avalonia has not changed between two canaries,
+so a red one means the environment moved. `revalidate` on a manual dispatch does the same on demand.
+
 Releasing is still a human step: set `BuildRev`, review `OptrisStaticGraphicsAngleBranch`, and push a
 `v<skiasharp>.<rev>` tag. `SkiaSharpVersion` needs no edit - preflight derives it from Avalonia, and
 refuses a build where an explicitly pinned SkiaSharp disagrees with the Avalonia being targeted.
