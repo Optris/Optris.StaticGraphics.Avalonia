@@ -297,7 +297,7 @@ jobs:
 
           # The GL-stub patch runs inside every Skia build on all three platforms, so a syntax
           # error in it is a syntax error in every one of them - discovered after the multi-GB
-          # depot_tools/SkiaSharp sync rather than here.
+          # SkiaSharp sync rather than here.
           python3 -m py_compile scripts/patch-skia-gl-stubs.py
 
           # Git records the executable bit, and a contributor on Windows adding a script will not

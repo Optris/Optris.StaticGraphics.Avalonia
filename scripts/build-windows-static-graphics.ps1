@@ -115,14 +115,15 @@ function Ensure-DepotTools {
     $env:PATH = "$depotDir;$env:PATH"
 }
 
-# The ninja that builds Skia, resolved past depot_tools. Ensure-DepotTools puts depot_tools first
-# on PATH, and its ninja.bat is only a wrapper: outside a gclient checkout it runs the first
-# ninja.exe on PATH that is not inside a depot_tools directory. Since depot_tools d4e95894
-# (2026-09-07) the wrapper also refuses to start until depot_tools has been bootstrapped, which a
-# plain clone never is, so every Skia build died at "python3_bin_reldir.txt not found" before
-# compiling anything. Applying the wrapper's own rule keeps the binary that has always built Skia,
-# minus the wrapper. ANGLE keeps the wrapper on purpose: its gclient sync bootstraps depot_tools,
-# and inside that checkout the wrapper runs the ninja ANGLE's DEPS pins.
+# Build-Skia deliberately leaves depot_tools off PATH: Skia needs nothing from it (gn comes from
+# Skia's bin/fetch-gn, git-sync-deps is plain git), and an unpinned clone of it is how upstream
+# broke every macOS and Windows Skia build at once. PATH can still carry one - Ensure-DepotTools'
+# change outlives this script in an interactive session, and any Chromium developer has one - and
+# its ninja.bat is only a wrapper: outside a gclient checkout it runs the first ninja.exe on PATH
+# not inside a depot_tools directory, and since d4e95894 (2026-09-07) it will not even start until
+# depot_tools has been bootstrapped. So ninja is resolved by the wrapper's own rule, without the
+# wrapper. ANGLE keeps the wrapper on purpose: its gclient sync bootstraps depot_tools, and inside
+# that checkout the wrapper runs the ninja ANGLE's DEPS pins.
 function Resolve-Ninja {
     $ninja = Get-Command ninja.exe -CommandType Application -All -ErrorAction SilentlyContinue |
         Where-Object { (Split-Path -Leaf (Split-Path -Parent $_.Source)) -ne "depot_tools" } |
@@ -1014,7 +1015,6 @@ function Invoke-SkiaGitSyncDeps($SkiaDir) {
 
 function Build-Skia {
     Ensure-Tools
-    Ensure-DepotTools
     $ninja = Resolve-Ninja
     $src = Sync-SkiaSharp
     $skiaDir = Join-Path $src "externals\skia"

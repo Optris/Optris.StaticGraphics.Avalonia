@@ -22,7 +22,7 @@ WORK_DIR="${WORK_DIR:-$ROOT_DIR/External/NativeStatic/.work}"
 TARGET_CPU="${TARGET_CPU:-x64}"
 RID="${RID:-linux-$TARGET_CPU}"
 # Tiers differ only in what is compiled in, so they share WORK_DIR - the multi-GB
-# depot_tools/SkiaSharp checkout is cloned once and reused by every tier - while the payload
+# SkiaSharp checkout is cloned once and reused by every tier - while the payload
 # is kept apart per tier so one tier can never overwrite another's archives.
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/External/NativeStatic/static-$TIER/$RID/native}"
 SKIASHARP_VERSION="${SKIASHARP_VERSION:-4.150.1}"
@@ -61,10 +61,6 @@ require_cmd() {
   fi
 }
 
-is_musl_rid() {
-  [[ "$RID" == linux-musl-* ]]
-}
-
 ensure_tools() {
   require_cmd git
   require_cmd python3
@@ -75,29 +71,21 @@ ensure_tools() {
   require_cmd pkg-config
 }
 
-ensure_depot_tools() {
-  local depot_dir="$WORK_DIR/depot_tools"
+# python3's directory goes first on PATH, as it always has here. On these images that is /usr/bin,
+# where the clang, ar and ninja the workflows install live, so this order can decide which
+# toolchain builds Skia - and keeping it means dropping depot_tools changed nothing else.
+put_python3_dir_first() {
   local python_bin_dir
   python_bin_dir="$(dirname "$(command -v python3)")"
-  if [[ ! -d "$depot_dir/.git" ]]; then
-    git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$depot_dir"
-  else
-    git -C "$depot_dir" pull --ff-only
-  fi
-  if is_musl_rid; then
-    initialize_depot_tools_system_python "$depot_dir"
-    patch_depot_tools_python_deps "$depot_dir"
-  fi
-  export PATH="$python_bin_dir:$depot_dir:$PATH"
+  export PATH="$python_bin_dir:$PATH"
 }
 
-# The ninja that builds Skia, resolved past depot_tools. depot_tools' `ninja` is only a wrapper:
-# outside a gclient checkout it runs the first ninja on PATH that is not inside a depot_tools
-# directory. Since depot_tools d4e95894 (2026-09-07) the wrapper also refuses to start until
-# depot_tools has been bootstrapped, which a plain clone never is - that killed every macOS and
-# Windows Skia build. Linux escaped only because python3's directory, put ahead of depot_tools
-# above, happens to hold ninja too. Applying the wrapper's own rule picks that same binary without
-# depending on where python3 is installed.
+# depot_tools is deliberately absent: nothing here needs it (gn comes from Skia's bin/fetch-gn,
+# git-sync-deps is plain git), and an unpinned clone of it is how upstream broke every macOS and
+# Windows Skia build at once. A developer's PATH may still carry one, and its `ninja` is only a
+# wrapper - outside a gclient checkout it runs the first ninja on PATH not inside a depot_tools
+# directory, and since d4e95894 (2026-09-07) it will not even start until depot_tools has been
+# bootstrapped. So ninja is resolved by the wrapper's own rule, without the wrapper.
 resolve_ninja() {
   local candidate
   while IFS= read -r candidate; do
@@ -108,57 +96,6 @@ resolve_ninja() {
   done < <(type -ap ninja)
   echo "No ninja on PATH outside depot_tools. Install one (ninja-build, or ninja on Alpine)." >&2
   return 1
-}
-
-initialize_depot_tools_system_python() {
-  local depot_dir="$1"
-  local python_bin_dir
-  python_bin_dir="$(dirname "$(command -v python3)")"
-
-  if [[ -d "$depot_dir" ]]; then
-    python3 - "$depot_dir" "$python_bin_dir" <<'PY'
-import os
-import pathlib
-import sys
-
-depot_dir = pathlib.Path(sys.argv[1]).resolve()
-python_bin_dir = pathlib.Path(sys.argv[2]).resolve()
-marker = depot_dir / "python3_bin_reldir.txt"
-marker.write_text(os.path.relpath(python_bin_dir, depot_dir) + "\n")
-PY
-  fi
-}
-
-patch_depot_tools_python_deps() {
-  local depot_dir="$1"
-  local gsutil_dir="$depot_dir/external_bin/gsutil/gsutil_4.68/gsutil"
-  local gsutil_third_party="$gsutil_dir/third_party"
-
-  if [[ -d "$gsutil_dir" && ! -f "$gsutil_dir/six.py" ]]; then
-    python3 - "$gsutil_dir/six.py" <<'PY'
-import pathlib
-import shutil
-import six
-import sys
-
-src = pathlib.Path(six.__file__)
-dest = pathlib.Path(sys.argv[1])
-shutil.copyfile(src, dest)
-PY
-  fi
-
-  if [[ -d "$gsutil_third_party" && ! -f "$gsutil_third_party/six.py" ]]; then
-    python3 - "$gsutil_third_party/six.py" <<'PY'
-import pathlib
-import shutil
-import six
-import sys
-
-src = pathlib.Path(six.__file__)
-dest = pathlib.Path(sys.argv[1])
-shutil.copyfile(src, dest)
-PY
-  fi
 }
 
 SKIA_CHECKOUT_DIR=""
@@ -184,7 +121,6 @@ resolve_llvm_nm() {
       "$SKIA_CHECKOUT_DIR/bin/llvm-nm"
     )
   fi
-  candidates+=("$WORK_DIR/depot_tools/llvm-build/Release+Asserts/bin/llvm-nm")
 
   # Alpine's llvm package installs only a versioned tree - /usr/lib/llvm19/bin/llvm-nm and no
   # /usr/bin/llvm-nm - so every name below misses it and resolution falls through to GNU nm,
@@ -553,7 +489,7 @@ sync_skia_deps() {
 
 build_skia() {
   ensure_tools
-  ensure_depot_tools
+  put_python3_dir_first
   local ninja_bin
   ninja_bin="$(resolve_ninja)"
   local src

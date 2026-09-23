@@ -203,11 +203,12 @@ alongside it so that a harness which has stopped asserting fails the build rathe
 
 `scripts/build-windows-static-graphics.ps1` takes `-Tier`; the Linux, musl and macOS shell scripts
 read `TIER` from the environment and default to `Vulkan`. Each tier builds into its own directory, so
-the multi-gigabyte depot_tools and Skia checkout is shared rather than re-cloned, and the payload
+the multi-gigabyte Skia checkout is shared rather than re-cloned, and the payload
 lands in `External/NativeStatic/static-$Tier/<rid>/native/`. Packing is
 `dotnet pack -p:Tier=<tier>`.
 
-Building Skia needs depot_tools, per-OS toolchains and hours; in practice it happens in CI.
+Building Skia needs per-OS toolchains and hours, and ANGLE on Windows needs depot_tools as well; in
+practice it happens in CI.
 `.github/workflows/release.yml` runs the preflight, then the platform workflows, packs
 each tier, runs the smoke tests, and only then publishes. The platform workflows
 (`static-graphics-windows.yml`, `-linux`, `-musl`, `-macos`) can be dispatched on their own when

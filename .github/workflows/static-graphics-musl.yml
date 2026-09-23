@@ -73,21 +73,11 @@ jobs:
             -e TIER="${{ matrix.tier }}" \
             -e SKIASHARP_VERSION="$SKIASHARP_VERSION" \
             -e LLVM_AR=llvm-ar \
-            -e DEPOT_TOOLS_BOOTSTRAP_PYTHON3=0 \
-            -e VPYTHON_BYPASS="manually managed python not supported by chrome operations" \
             "$DOTNET_ALPINE_IMAGE" \
             sh -lc '
               set -e
-              apk add --no-cache binutils bash ca-certificates git python3 py3-httplib2 py3-pysocks py3-six clang compiler-rt lld llvm g++ ninja pkgconf fontconfig-dev glib-dev mesa-dev libx11-dev libxcb-dev libxext-dev pciutils-dev linux-headers perl curl tar xz patch gcompat libc6-compat
+              apk add --no-cache binutils bash ca-certificates git python3 clang compiler-rt lld llvm g++ ninja pkgconf fontconfig-dev glib-dev mesa-dev libx11-dev libxcb-dev libxext-dev pciutils-dev linux-headers perl curl tar xz patch gcompat libc6-compat
               git config --global --add safe.directory "*"
-              python3 - <<'"'"'PY'"'"'
-          import pathlib
-          import httplib2
-
-          path = pathlib.Path(httplib2.__file__).with_name("socks.py")
-          if not path.exists():
-            path.write_text("from socks import *\n")
-          PY
               bash scripts/build-linux-static-graphics.sh skia
             '
 

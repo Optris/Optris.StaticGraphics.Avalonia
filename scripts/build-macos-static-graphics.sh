@@ -27,7 +27,7 @@ WORK_DIR="${WORK_DIR:-$ROOT_DIR/External/NativeStatic/.work}"
 TARGET_CPU="${TARGET_CPU:-arm64}"
 RID="${RID:-osx-$TARGET_CPU}"
 # Tiers differ only in what is compiled in, so they share WORK_DIR - the multi-GB
-# depot_tools/SkiaSharp checkout is cloned once and reused by every tier - while the payload
+# SkiaSharp checkout is cloned once and reused by every tier - while the payload
 # is kept apart per tier so one tier can never overwrite another's archives.
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/External/NativeStatic/static-$TIER/$RID/native}"
 SKIASHARP_VERSION="${SKIASHARP_VERSION:-4.150.1}"
@@ -76,22 +76,12 @@ ensure_tools() {
   require_cmd ninja
 }
 
-ensure_depot_tools() {
-  local depot_dir="$WORK_DIR/depot_tools"
-  if [[ ! -d "$depot_dir/.git" ]]; then
-    git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$depot_dir"
-  else
-    git -C "$depot_dir" pull --ff-only
-  fi
-  export PATH="$depot_dir:$PATH"
-}
-
-# The ninja that builds Skia, resolved past depot_tools. ensure_depot_tools puts depot_tools first
-# on PATH, and its `ninja` is only a wrapper: outside a gclient checkout it runs the first ninja on
-# PATH that is not inside a depot_tools directory. Since depot_tools d4e95894 (2026-09-07) the
-# wrapper also refuses to start until depot_tools has been bootstrapped, which a plain clone never
-# is, so every Skia build died at "python3_bin_reldir.txt not found" before compiling anything.
-# Applying the wrapper's own rule keeps the binary that has always built Skia, minus the wrapper.
+# depot_tools is deliberately absent: nothing here needs it (gn comes from Skia's bin/fetch-gn,
+# git-sync-deps is plain git), and an unpinned clone of it is how upstream broke every macOS and
+# Windows Skia build at once. A developer's PATH may still carry one, and its `ninja` is only a
+# wrapper - outside a gclient checkout it runs the first ninja on PATH not inside a depot_tools
+# directory, and since d4e95894 (2026-09-07) it will not even start until depot_tools has been
+# bootstrapped. So ninja is resolved by the wrapper's own rule, without the wrapper.
 resolve_ninja() {
   local candidate
   while IFS= read -r candidate; do
@@ -141,7 +131,6 @@ resolve_llvm_nm() {
       "$SKIA_CHECKOUT_DIR/bin/llvm-nm"
     )
   fi
-  candidates+=("$WORK_DIR/depot_tools/llvm-build/Release+Asserts/bin/llvm-nm")
   if command -v xcrun >/dev/null 2>&1; then
     candidates+=("$(xcrun --find llvm-nm 2>/dev/null || true)" "$(xcrun --find nm 2>/dev/null || true)")
   fi
@@ -496,7 +485,6 @@ sync_skia_deps() {
 
 build_skia() {
   ensure_tools
-  ensure_depot_tools
   local ninja_bin
   ninja_bin="$(resolve_ninja)"
   local src

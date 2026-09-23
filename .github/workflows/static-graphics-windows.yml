@@ -165,9 +165,9 @@ jobs:
 
       - name: 💾 Restore native build cache
         uses: actions/cache@v4
-        # The depot_tools and SkiaSharp checkouts under .work are tier independent — only the
-        # gn output tree differs — so the tier stays out of the key and every tier of this RID
-        # shares one entry instead of three.
+        # The SkiaSharp checkout under .work is tier independent — only the gn output tree
+        # differs — so the tier stays out of the key and every tier of this RID shares one entry
+        # instead of three.
         with:
           path: External/NativeStatic/.work
           key: native-work-windows-${{ matrix.rid }}-skia-${{ inputs.skiasharp_version }}-${{ hashFiles('scripts/build-windows-static-graphics.ps1') }}
