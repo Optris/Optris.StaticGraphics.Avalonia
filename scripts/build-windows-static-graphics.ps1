@@ -115,6 +115,24 @@ function Ensure-DepotTools {
     $env:PATH = "$depotDir;$env:PATH"
 }
 
+# The ninja that builds Skia, resolved past depot_tools. Ensure-DepotTools puts depot_tools first
+# on PATH, and its ninja.bat is only a wrapper: outside a gclient checkout it runs the first
+# ninja.exe on PATH that is not inside a depot_tools directory. Since depot_tools d4e95894
+# (2026-09-07) the wrapper also refuses to start until depot_tools has been bootstrapped, which a
+# plain clone never is, so every Skia build died at "python3_bin_reldir.txt not found" before
+# compiling anything. Applying the wrapper's own rule keeps the binary that has always built Skia,
+# minus the wrapper. ANGLE keeps the wrapper on purpose: its gclient sync bootstraps depot_tools,
+# and inside that checkout the wrapper runs the ninja ANGLE's DEPS pins.
+function Resolve-Ninja {
+    $ninja = Get-Command ninja.exe -CommandType Application -All -ErrorAction SilentlyContinue |
+        Where-Object { (Split-Path -Leaf (Split-Path -Parent $_.Source)) -ne "depot_tools" } |
+        Select-Object -First 1
+    if (-not $ninja) {
+        throw "No ninja.exe on PATH outside depot_tools. Install one: choco install ninja"
+    }
+    return $ninja.Source
+}
+
 function Resolve-LlvmNm {
     if ($script:LlvmNmPath) {
         return $script:LlvmNmPath
@@ -997,6 +1015,7 @@ function Invoke-SkiaGitSyncDeps($SkiaDir) {
 function Build-Skia {
     Ensure-Tools
     Ensure-DepotTools
+    $ninja = Resolve-Ninja
     $src = Sync-SkiaSharp
     $skiaDir = Join-Path $src "externals\skia"
     $script:SkiaCheckoutDir = $skiaDir
@@ -1106,7 +1125,7 @@ extra_cflags_cc = [ "/GR" ]
     try {
         & (Join-Path $skiaDir "bin\gn.exe") gen $outDir
         Assert-LastExitCode "gn gen $outDir"
-        ninja -C $outDir -j $BuildJobs skia SkiaSharp HarfBuzzSharp
+        & $ninja -C $outDir -j $BuildJobs skia SkiaSharp HarfBuzzSharp
         Assert-LastExitCode "ninja skia SkiaSharp HarfBuzzSharp in $outDir"
     } finally {
         Pop-Location

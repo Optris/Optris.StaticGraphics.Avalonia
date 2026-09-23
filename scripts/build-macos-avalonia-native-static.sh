@@ -26,7 +26,18 @@ if git -C "$src" config -f .gitmodules --get-regexp path | grep -q 'external/Num
 fi
 
 if [[ ! -f "$src/native/Avalonia.Native/inc/avalonia-native.h" ]]; then
-  bash "$src/native/Avalonia.Native/generate-headers.sh"
+  # Avalonia 12.1.3 moved header generation out of the nuke build into Avalonia.Native.macOS.proj
+  # (AvaloniaUI/Avalonia#22147), and the generate-headers.sh shipped with it builds
+  # ./Avalonia.Native.macOS.csproj - a file that does not exist. So the project is asked directly
+  # wherever it exists, which works however upstream ends up spelling the script, and the script
+  # stays for the releases before it. Only the header is wanted here: the library is built from
+  # the Xcode project below as a static archive, so the project's own dylib build is kept off.
+  header_project="$src/native/Avalonia.Native/Avalonia.Native.macOS.proj"
+  if [[ -f "$header_project" ]]; then
+    dotnet build "$header_project" -t:GenerateMicroComItems -p:BuildAvaloniaNativeXcodeProject=false
+  else
+    bash "$src/native/Avalonia.Native/generate-headers.sh"
+  fi
 fi
 
 project="$src/native/Avalonia.Native/src/OSX/Avalonia.Native.OSX.xcodeproj"

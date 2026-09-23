@@ -86,6 +86,24 @@ ensure_depot_tools() {
   export PATH="$depot_dir:$PATH"
 }
 
+# The ninja that builds Skia, resolved past depot_tools. ensure_depot_tools puts depot_tools first
+# on PATH, and its `ninja` is only a wrapper: outside a gclient checkout it runs the first ninja on
+# PATH that is not inside a depot_tools directory. Since depot_tools d4e95894 (2026-09-07) the
+# wrapper also refuses to start until depot_tools has been bootstrapped, which a plain clone never
+# is, so every Skia build died at "python3_bin_reldir.txt not found" before compiling anything.
+# Applying the wrapper's own rule keeps the binary that has always built Skia, minus the wrapper.
+resolve_ninja() {
+  local candidate
+  while IFS= read -r candidate; do
+    if [[ "$(basename "$(dirname "$candidate")")" != "depot_tools" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done < <(type -ap ninja)
+  echo "No ninja on PATH outside depot_tools. Install one: brew install ninja" >&2
+  return 1
+}
+
 copy_first_existing() {
   local dest="$1"
   shift
@@ -479,6 +497,8 @@ sync_skia_deps() {
 build_skia() {
   ensure_tools
   ensure_depot_tools
+  local ninja_bin
+  ninja_bin="$(resolve_ninja)"
   local src
   src="$(sync_skiasharp)"
   local skia_dir="$src/externals/skia"
@@ -555,7 +575,7 @@ extra_cflags_cc = [ "-frtti" ]
 EOF_ARGS
 
   (cd "$skia_dir" && "$skia_dir/bin/gn" gen "$out_dir")
-  ninja -C "$out_dir" -j "$BUILD_JOBS" skia SkiaSharp HarfBuzzSharp
+  "$ninja_bin" -C "$out_dir" -j "$BUILD_JOBS" skia SkiaSharp HarfBuzzSharp
   copy_first_existing "$OUTPUT_DIR/libskia.a" "$out_dir/libskia.a" "$out_dir/obj/libskia.a"
   copy_first_existing "$OUTPUT_DIR/libSkiaSharp.a" "$out_dir/libSkiaSharp.a" "$out_dir/obj/libSkiaSharp.a"
   copy_first_existing "$OUTPUT_DIR/libHarfBuzzSharp.a" "$out_dir/libHarfBuzzSharp.a" "$out_dir/obj/libHarfBuzzSharp.a"

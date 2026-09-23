@@ -91,6 +91,25 @@ ensure_depot_tools() {
   export PATH="$python_bin_dir:$depot_dir:$PATH"
 }
 
+# The ninja that builds Skia, resolved past depot_tools. depot_tools' `ninja` is only a wrapper:
+# outside a gclient checkout it runs the first ninja on PATH that is not inside a depot_tools
+# directory. Since depot_tools d4e95894 (2026-09-07) the wrapper also refuses to start until
+# depot_tools has been bootstrapped, which a plain clone never is - that killed every macOS and
+# Windows Skia build. Linux escaped only because python3's directory, put ahead of depot_tools
+# above, happens to hold ninja too. Applying the wrapper's own rule picks that same binary without
+# depending on where python3 is installed.
+resolve_ninja() {
+  local candidate
+  while IFS= read -r candidate; do
+    if [[ "$(basename "$(dirname "$candidate")")" != "depot_tools" ]]; then
+      echo "$candidate"
+      return 0
+    fi
+  done < <(type -ap ninja)
+  echo "No ninja on PATH outside depot_tools. Install one (ninja-build, or ninja on Alpine)." >&2
+  return 1
+}
+
 initialize_depot_tools_system_python() {
   local depot_dir="$1"
   local python_bin_dir
@@ -535,6 +554,8 @@ sync_skia_deps() {
 build_skia() {
   ensure_tools
   ensure_depot_tools
+  local ninja_bin
+  ninja_bin="$(resolve_ninja)"
   local src
   src="$(sync_skiasharp)"
   sync_skia_deps "$src"
@@ -615,7 +636,7 @@ extra_ldflags = [ "-static-libstdc++", "-static-libgcc" ]
 EOF_ARGS
 
   (cd "$skia_dir" && "$skia_dir/bin/gn" gen "$out_dir")
-  ninja -C "$out_dir" -j "$BUILD_JOBS" skia SkiaSharp HarfBuzzSharp
+  "$ninja_bin" -C "$out_dir" -j "$BUILD_JOBS" skia SkiaSharp HarfBuzzSharp
 
   copy_first_existing "$OUTPUT_DIR/libskia.a" \
     "$out_dir/libskia.a" \
