@@ -24,15 +24,20 @@ On macOS the Vulkan tier is delivered by Metal. Skia does not vendor MoltenVK, s
 reach Apple GPUs; Metal is what Avalonia asks for there anyway.
 
 ```xml
-<PackageReference Include="Optris.StaticGraphics.Avalonia.Vulkan" Version="4.150.1.1" />
+<PackageReference Include="Optris.StaticGraphics.Avalonia.Vulkan" Version="3.119.4.2" />
 ```
 
-For macOS also reference `Optris.StaticGraphics.AvaloniaNative`, which is tier-independent but must
-match your Avalonia version because it contains `libAvaloniaNative.a`.
+The first three parts of the version ARE the SkiaSharp version, and they are not a free choice:
+they must be the SkiaSharp that your Avalonia depends on, because the managed bindings come from
+`Avalonia.Skia`. Avalonia 12.0.4 and every 12.1.x depend on SkiaSharp 3.119.4, so use
+`3.119.4.x`; 12.0.0 through 12.0.3 are on SkiaSharp 3.119.3/3.119.4 *previews* instead.
+The fourth part is this package's own build revision. A mismatch is not a build error - NuGet
+resolves it silently and you ship native code the managed bindings were not compiled against.
 
-```xml
-<PackageReference Include="Optris.StaticGraphics.AvaloniaNative" Version="12.1.1.1" />
-```
+> **macOS note.** A companion package `Optris.StaticGraphics.AvaloniaNative`, carrying
+> `libAvaloniaNative.a`, is built by this repository but is **not published to nuget.org**.
+> Earlier revisions of this file told you to reference it; that reference cannot resolve. Build
+> it from source if you need it.
 
 ## Publish
 
