@@ -60,7 +60,10 @@
              fallback exists, while producing 0.0.0-local.1: obviously wrong at a glance, matched
              by no consumer range, and rejected by nuget.org. -->
         <SkiaSharpVersion Condition="'$(SkiaSharpVersion)' == ''">0.0.0-local</SkiaSharpVersion>
-        <BuildRev Condition="'$(BuildRev)' == ''">1</BuildRev>
+        <!-- The fork build revision: the fourth part of the version, bumped when the SAME
+             SkiaSharp is republished. 2 carries the README correction - 1 shipped a
+             copy-paste snippet naming versions that have never existed. -->
+        <BuildRev Condition="'$(BuildRev)' == ''">2</BuildRev>
         <Version>$(SkiaSharpVersion).$(BuildRev)</Version>
 
         <Authors>Optris GmbH, original by greepar</Authors>
