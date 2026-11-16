@@ -41,15 +41,25 @@
             and every consumer of a consumer to opt into prereleases forever. The ANGLE branch that
             used to sit in the prerelease label is published as a property instead.
         -->
-        <!-- A LOCAL FALLBACK ONLY. Every CI path passes -p:SkiaSharpVersion, and passes the
-             version read off the Avalonia release being targeted rather than a number chosen
+        <!-- A LOCAL FALLBACK ONLY, and deliberately an UNSHIPPABLE one. Every CI path passes
+             -p:SkiaSharpVersion, read off the Avalonia release being targeted rather than chosen
              here: Avalonia.Skia's dependency is what a consumer's managed bindings will be, and
              building the native library from a different major than those bindings expect is a
              mismatch NuGet resolves silently by upgrading the loser. Preflight derives it and
-             refuses any explicit value that disagrees. Left non-empty so a bare `dotnet pack`
-             still works locally; if you rely on this number for anything shipped, that is the
-             bug. -->
-        <SkiaSharpVersion Condition="'$(SkiaSharpVersion)' == ''">4.150.1</SkiaSharpVersion>
+             refuses any explicit value that disagrees.
+
+             This used to read 4.150.1, which made a bare local `dotnet pack` mint a plausible
+             looking 4.150.1.1. That is worse than a failure in two ways. It sorts ABOVE every
+             real release (3.119.4.x), so pushing one by accident would hand it to every consumer
+             with a floating or range reference, permanently - nuget.org cannot withdraw a
+             version, only unlist it, and unlisting does not rescue an existing [3.119.4, )
+             resolve. And it leaked into the packed README, which told people on nuget.org to
+             reference a version that has never existed.
+
+             0.0.0-local keeps a bare `dotnet pack` working, which is the only reason this
+             fallback exists, while producing 0.0.0-local.1: obviously wrong at a glance, matched
+             by no consumer range, and rejected by nuget.org. -->
+        <SkiaSharpVersion Condition="'$(SkiaSharpVersion)' == ''">0.0.0-local</SkiaSharpVersion>
         <BuildRev Condition="'$(BuildRev)' == ''">1</BuildRev>
         <Version>$(SkiaSharpVersion).$(BuildRev)</Version>
 
