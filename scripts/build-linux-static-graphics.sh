@@ -30,7 +30,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/External/NativeStatic/static-$TIER/$RID/nati
 # depends on. A wrong guess builds native code the consumer's managed bindings were not
 # compiled against, which NuGet resolves silently rather than failing. CI derives it in
 # static-graphics-preflight.yml; set it by hand only if you know what you are matching.
-SKIASHARP_VERSION="${SKIASHARP_VERSION:?set it to the SkiaSharp release the targeted Avalonia depends on; preflight derives this from Avalonia.Skia's nuspec}"
+SKIASHARP_VERSION="${SKIASHARP_VERSION:?set it to the SkiaSharp release that the targeted Avalonia depends on - preflight derives it from the Avalonia.Skia nuspec}"
 BUILD_JOBS="${BUILD_JOBS:-$(nproc)}"
 SKIA_DEPS_RETRIES="${SKIA_DEPS_RETRIES:-3}"
 
