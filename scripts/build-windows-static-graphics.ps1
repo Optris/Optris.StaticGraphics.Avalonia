@@ -27,7 +27,13 @@ $Backends = $TierBackends[$Tier]
 
 $RootDir = Split-Path -Parent $PSScriptRoot
 $WorkDir = if ($env:WORK_DIR) { $env:WORK_DIR } else { Join-Path $RootDir "External\NativeStatic\.work" }
-$SkiaSharpVersion = if ($env:SKIASHARP_VERSION) { $env:SKIASHARP_VERSION } else { "4.150.1" }
+# No default on purpose - see the note in build-linux-static-graphics.sh. This selects the
+# mono/SkiaSharp release branch the native libraries are built from, and it has to be the
+# SkiaSharp that the targeted Avalonia depends on. CI derives it in static-graphics-preflight.yml.
+$SkiaSharpVersion = if ($env:SKIASHARP_VERSION) { $env:SKIASHARP_VERSION } else {
+    throw "SKIASHARP_VERSION is not set. It must match the SkiaSharp that the targeted Avalonia " +
+          "depends on; preflight derives it from Avalonia.Skia's nuspec. Refusing to guess."
+}
 $AngleBranch = if ($env:ANGLE_BRANCH) { $env:ANGLE_BRANCH } else { "7922" }
 $TargetCpu = if ($env:TARGET_CPU) { $env:TARGET_CPU } else { "x64" }
 $Rid = if ($env:RID) { $env:RID } else { "win-$TargetCpu" }

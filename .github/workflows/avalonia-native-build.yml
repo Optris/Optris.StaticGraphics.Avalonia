@@ -23,7 +23,7 @@ jobs:
       matrix:
         include:
           - rid: osx-x64
-            runner: macos-14
+            runner: macos-15
           - rid: osx-arm64
             runner: macos-15
     runs-on: ${{ matrix.runner }}

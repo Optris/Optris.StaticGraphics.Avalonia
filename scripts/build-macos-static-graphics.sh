@@ -30,7 +30,12 @@ RID="${RID:-osx-$TARGET_CPU}"
 # SkiaSharp checkout is cloned once and reused by every tier - while the payload
 # is kept apart per tier so one tier can never overwrite another's archives.
 OUTPUT_DIR="${OUTPUT_DIR:-$ROOT_DIR/External/NativeStatic/static-$TIER/$RID/native}"
-SKIASHARP_VERSION="${SKIASHARP_VERSION:-4.150.1}"
+# No default on purpose: this selects the mono/SkiaSharp release branch the native
+# libraries are built from, and it has to be the SkiaSharp that the targeted Avalonia
+# depends on. A wrong guess builds native code the consumer's managed bindings were not
+# compiled against, which NuGet resolves silently rather than failing. CI derives it in
+# static-graphics-preflight.yml; set it by hand only if you know what you are matching.
+SKIASHARP_VERSION="${SKIASHARP_VERSION:?set it to the SkiaSharp release that the targeted Avalonia depends on - preflight derives it from the Avalonia.Skia nuspec}"
 BUILD_JOBS="${BUILD_JOBS:-$(sysctl -n hw.ncpu)}"
 SKIA_DEPS_RETRIES="${SKIA_DEPS_RETRIES:-3}"
 
@@ -45,7 +50,8 @@ Environment:
                       Default: External/NativeStatic/.work
   OUTPUT_DIR          Final static library directory.
                       Default: External/NativeStatic/static-$TIER/$RID/native
-  SKIASHARP_VERSION   SkiaSharp release branch version. Default: 4.150.1
+  SKIASHARP_VERSION   SkiaSharp release branch version. REQUIRED, no default - it must
+                      match the SkiaSharp that the targeted Avalonia depends on.
   TARGET_CPU          GN target_cpu. Default: arm64. Supported: x64, arm64
   RID                 Output RID. Default: osx-$TARGET_CPU
   BUILD_JOBS          Ninja parallelism. Default: sysctl hw.ncpu
