@@ -39,6 +39,32 @@ SKIASHARP_VERSION="${SKIASHARP_VERSION:?set it to the SkiaSharp release that the
 BUILD_JOBS="${BUILD_JOBS:-$(sysctl -n hw.ncpu)}"
 SKIA_DEPS_RETRIES="${SKIA_DEPS_RETRIES:-3}"
 
+# Upstream is cloned anonymously, and GitHub now and then refuses a single anonymous request: on
+# 24 November 2026 two osx-arm64 legs got HTTP 401 cloning mono/SkiaSharp, while an osx-x64 leg on
+# the same runner image cloned it fine in between. One refused request must not end a validation
+# run, so every git operation that reaches a remote is retried with a growing pause.
+# GIT_TERMINAL_PROMPT=0 makes that 401 a plain failure instead of a credential prompt that nobody
+# can answer ("could not read Username ... Device not configured").
+GIT_RETRIES="${GIT_RETRIES:-4}"
+export GIT_TERMINAL_PROMPT=0
+
+# Only for operations that reach a remote. A purely local failure, such as a checkout refused over
+# a dirty cached tree, is deterministic, and retrying it only delays the same error.
+git_with_retries() {
+  local attempt
+  for attempt in $(seq 1 "$GIT_RETRIES"); do
+    if git "$@"; then
+      return 0
+    fi
+    if [[ "$attempt" == "$GIT_RETRIES" ]]; then
+      echo "git $* failed $GIT_RETRIES times; giving up." >&2
+      return 1
+    fi
+    echo "git $* failed; retrying in $((attempt * 20))s ($attempt/$GIT_RETRIES)..." >&2
+    sleep $((attempt * 20))
+  done
+}
+
 usage() {
   cat <<'USAGE'
 Usage: scripts/build-macos-static-graphics.sh [skia|all]
@@ -439,15 +465,20 @@ assert_c_api_entry_points() {
   echo "C API entry points wired, not stubbed, for tier '$TIER': ${verified[*]}."
 }
 
+# Called as src="$(sync_skiasharp)", and bash does not apply errexit inside a command
+# substitution, so every step says `|| return 1` itself. Without that a failed clone fell through
+# to `echo "$src"`, the function returned success, and the build died two steps later on a
+# FileNotFoundError from git-sync-deps that named neither git nor the network. All git output goes
+# to stderr because stdout is the return value.
 sync_skiasharp() {
   local src="$WORK_DIR/SkiaSharp-$SKIASHARP_VERSION"
   if [[ ! -d "$src/.git" ]]; then
-    git clone --depth 1 --branch "release/$SKIASHARP_VERSION" https://github.com/mono/SkiaSharp.git "$src"
+    git_with_retries clone --depth 1 --branch "release/$SKIASHARP_VERSION" https://github.com/mono/SkiaSharp.git "$src" >&2 || return 1
   else
-    git -C "$src" fetch --depth 1 origin "release/$SKIASHARP_VERSION"
-    git -C "$src" checkout -q FETCH_HEAD
+    git_with_retries -C "$src" fetch --depth 1 origin "release/$SKIASHARP_VERSION" >&2 || return 1
+    git -C "$src" checkout -q FETCH_HEAD >&2 || return 1
   fi
-  git -C "$src" submodule update --init --depth 1 externals/skia >&2
+  git_with_retries -C "$src" submodule update --init --depth 1 externals/skia >&2 || return 1
   echo "$src"
 }
 

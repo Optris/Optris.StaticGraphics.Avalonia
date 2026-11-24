@@ -45,6 +45,15 @@ $BuildJobs = if ($env:BUILD_JOBS) { $env:BUILD_JOBS } else { [Environment]::Proc
 $AnglePatchDir = if ($env:ANGLE_PATCH_DIR) { $env:ANGLE_PATCH_DIR } else { Join-Path $RootDir "External\NativeStatic\patches" }
 $SkiaDepsRetries = if ($env:SKIA_DEPS_RETRIES) { [int]$env:SKIA_DEPS_RETRIES } else { 3 }
 
+# Upstream is cloned anonymously, and GitHub now and then refuses a single anonymous request: on
+# 24 November 2026 two osx-arm64 legs got HTTP 401 cloning mono/SkiaSharp, while an osx-x64 leg on
+# the same runner image cloned it fine in between. Nothing about that is macOS-specific. One
+# refused request must not end a validation run, so every git operation that reaches a remote is
+# retried with a growing pause. GIT_TERMINAL_PROMPT=0 makes a refused request a plain failure
+# instead of a credential prompt that nobody can answer.
+$GitRetries = if ($env:GIT_RETRIES) { [int]$env:GIT_RETRIES } else { 4 }
+$env:GIT_TERMINAL_PROMPT = "0"
+
 # The one place the MSVC location is decided, so the GYP environment below and Skia's own win_vc
 # GN arg can never disagree about which compiler is being used.
 # VSINSTALLDIR is deliberately NOT consulted: it is ambient, any developer prompt or installer can
@@ -100,6 +109,23 @@ function Assert-LastExitCode($What) {
     }
 }
 
+# Only for operations that reach a remote. A purely local failure, such as a checkout refused over
+# a dirty cached tree, is deterministic, and retrying it only delays the same error.
+function Invoke-GitWithRetries([string]$What, [string[]]$GitArgs) {
+    for ($attempt = 1; $attempt -le $GitRetries; $attempt++) {
+        $null = & git @GitArgs
+        if ($LASTEXITCODE -eq 0) {
+            return
+        }
+        if ($attempt -eq $GitRetries) {
+            throw "$What failed $GitRetries times; the last attempt exited with code $LASTEXITCODE."
+        }
+        $pause = 20 * $attempt
+        Write-Warning "$What failed with exit code $LASTEXITCODE; retrying in ${pause}s ($attempt/$GitRetries)..."
+        Start-Sleep -Seconds $pause
+    }
+}
+
 function Ensure-Tools {
     Require-Command git
     Require-Command python
@@ -110,13 +136,11 @@ function Ensure-Tools {
 function Ensure-DepotTools {
     $depotDir = Join-Path $WorkDir "depot_tools"
     if (-not (Test-Path (Join-Path $depotDir ".git"))) {
-        $null = git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git $depotDir
-        Assert-LastExitCode "git clone depot_tools into $depotDir"
+        Invoke-GitWithRetries "git clone depot_tools into $depotDir" @("clone", "--depth", "1", "https://chromium.googlesource.com/chromium/tools/depot_tools.git", $depotDir)
     } else {
         # A half-cloned or un-updatable depot_tools is not a warning: gclient and ninja are taken
         # from it below, so continuing here means building with whatever the cache happened to hold.
-        $null = git -C $depotDir pull --ff-only
-        Assert-LastExitCode "git pull --ff-only in $depotDir"
+        Invoke-GitWithRetries "git pull --ff-only in $depotDir" @("-C", $depotDir, "pull", "--ff-only")
     }
     $env:PATH = "$depotDir;$env:PATH"
 }
@@ -947,11 +971,9 @@ function New-WinX86SkiaStdcallThunks([string[]]$InputLibraries, [string[]]$Bindi
 function Sync-SkiaSharp {
     $src = Join-Path $WorkDir "SkiaSharp-$SkiaSharpVersion"
     if (-not (Test-Path (Join-Path $src ".git"))) {
-        $null = git -c core.longpaths=true clone --depth 1 --branch "release/$SkiaSharpVersion" https://github.com/mono/SkiaSharp.git $src
-        Assert-LastExitCode "git clone SkiaSharp release/$SkiaSharpVersion"
+        Invoke-GitWithRetries "git clone SkiaSharp release/$SkiaSharpVersion" @("-c", "core.longpaths=true", "clone", "--depth", "1", "--branch", "release/$SkiaSharpVersion", "https://github.com/mono/SkiaSharp.git", $src)
     } else {
-        $null = git -C $src fetch --depth 1 origin "release/$SkiaSharpVersion"
-        Assert-LastExitCode "git fetch release/$SkiaSharpVersion in $src"
+        Invoke-GitWithRetries "git fetch release/$SkiaSharpVersion in $src" @("-C", $src, "fetch", "--depth", "1", "origin", "release/$SkiaSharpVersion")
         $null = git -C $src checkout -q FETCH_HEAD
         Assert-LastExitCode "git checkout FETCH_HEAD in $src"
     }
@@ -964,8 +986,7 @@ function Sync-SkiaSharp {
     # $ErrorActionPreference does not cover git. The result was a rebuild issued to pick up an
     # upstream fix that silently did not contain it, published under a bumped BuildRev while every
     # downstream check verified the wrong revision perfectly truthfully.
-    $null = git -C $src submodule update --init --depth 1 externals/skia
-    Assert-LastExitCode "git submodule update externals/skia in $src"
+    Invoke-GitWithRetries "git submodule update externals/skia in $src" @("-C", $src, "submodule", "update", "--init", "--depth", "1", "externals/skia")
     return $src
 }
 
@@ -1159,16 +1180,14 @@ extra_cflags_cc = [ "/GR" ]
 function Sync-Angle {
     $src = Join-Path $WorkDir "ANGLE-$AngleBranch"
     if (-not (Test-Path (Join-Path $src ".git"))) {
-        $null = git -c core.longpaths=true clone --depth 1 --branch "chromium/$AngleBranch" https://github.com/google/angle.git $src
-        Assert-LastExitCode "git clone ANGLE chromium/$AngleBranch"
+        Invoke-GitWithRetries "git clone ANGLE chromium/$AngleBranch" @("-c", "core.longpaths=true", "clone", "--depth", "1", "--branch", "chromium/$AngleBranch", "https://github.com/google/angle.git", $src)
     } else {
         # Same dirty-cache trap as Sync-SkiaSharp, and here the rewritten files are in this repo
         # itself: Apply-AnglePatches edits BUILD.gn and the branch patch edits DEPS, in a tree
         # actions/cache then saves. If chromium/$AngleBranch has moved onto either of them, this
         # checkout exits non-zero and leaves the old revision in place. Failing is the point - the
         # alternative is building a revision nobody asked for and shipping it as $AngleBranch.
-        $null = git -C $src fetch --depth 1 origin "chromium/$AngleBranch"
-        Assert-LastExitCode "git fetch chromium/$AngleBranch in $src"
+        Invoke-GitWithRetries "git fetch chromium/$AngleBranch in $src" @("-C", $src, "fetch", "--depth", "1", "origin", "chromium/$AngleBranch")
         $null = git -C $src checkout -q FETCH_HEAD
         Assert-LastExitCode "git checkout FETCH_HEAD in $src"
     }
