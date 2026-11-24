@@ -14,11 +14,11 @@ version plus a build revision, and it has to match the Avalonia version of the a
 > relate, not something that will restore today.
 
 ```xml
-<PackageReference Include="Avalonia" Version="12.1.6" />
-<PackageReference Include="Optris.StaticGraphics.AvaloniaNative" Version="12.1.6.1" />
-<PackageReference Include="Optris.StaticGraphics.Avalonia.Vulkan" Version="3.119.4.2" />
+<PackageReference Include="Avalonia" Version="12.2.0" />
+<PackageReference Include="Optris.StaticGraphics.AvaloniaNative" Version="12.2.0.1" />
+<PackageReference Include="Optris.StaticGraphics.Avalonia.Vulkan" Version="3.119.4.3" />
 ```
 
-The AvaloniaNative version tracks **Avalonia** (12.1.6 -> `12.1.6.x`), while the tier package
-version tracks the **SkiaSharp** that Avalonia depends on (Avalonia 12.1.6 -> SkiaSharp 3.119.4 ->
+The AvaloniaNative version tracks **Avalonia** (12.2.0 -> `12.2.0.x`), while the tier package
+version tracks the **SkiaSharp** that Avalonia depends on (Avalonia 12.2.0 -> SkiaSharp 3.119.4 ->
 `3.119.4.x`). The two therefore do not match each other, and that is expected.

@@ -62,8 +62,9 @@
         <SkiaSharpVersion Condition="'$(SkiaSharpVersion)' == ''">0.0.0-local</SkiaSharpVersion>
         <!-- The fork build revision: the fourth part of the version, bumped when the SAME
              SkiaSharp is republished. 2 carries the README correction - 1 shipped a
-             copy-paste snippet naming versions that have never existed. -->
-        <BuildRev Condition="'$(BuildRev)' == ''">2</BuildRev>
+             copy-paste snippet naming versions that have never existed. 3 is the first
+             validated against Avalonia 12.2.0, which keeps SkiaSharp 3.119.4. -->
+        <BuildRev Condition="'$(BuildRev)' == ''">3</BuildRev>
         <Version>$(SkiaSharpVersion).$(BuildRev)</Version>
 
         <Authors>Optris GmbH, original by greepar</Authors>

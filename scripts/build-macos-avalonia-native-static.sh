@@ -15,14 +15,40 @@ esac
 
 mkdir -p "$WORK_DIR" "$OUTPUT_DIR"
 
+# Upstream is cloned anonymously, and GitHub now and then refuses a single anonymous request: on
+# 24 November 2026 two osx-arm64 legs got HTTP 401 cloning mono/SkiaSharp, while an osx-x64 leg on
+# the same runner image cloned it fine in between. One refused request must not end a validation
+# run, so every git operation that reaches a remote is retried with a growing pause.
+# GIT_TERMINAL_PROMPT=0 makes that 401 a plain failure instead of a credential prompt that nobody
+# can answer ("could not read Username ... Device not configured").
+GIT_RETRIES="${GIT_RETRIES:-4}"
+export GIT_TERMINAL_PROMPT=0
+
+# Only for operations that reach a remote. A purely local failure, such as a checkout refused over
+# a dirty cached tree, is deterministic, and retrying it only delays the same error.
+git_with_retries() {
+  local attempt
+  for attempt in $(seq 1 "$GIT_RETRIES"); do
+    if git "$@"; then
+      return 0
+    fi
+    if [[ "$attempt" == "$GIT_RETRIES" ]]; then
+      echo "git $* failed $GIT_RETRIES times; giving up." >&2
+      return 1
+    fi
+    echo "git $* failed; retrying in $((attempt * 20))s ($attempt/$GIT_RETRIES)..." >&2
+    sleep $((attempt * 20))
+  done
+}
+
 src="$WORK_DIR/Avalonia-$AVALONIA_VERSION"
 if [[ ! -d "$src/.git" ]]; then
   rm -rf "$src"
-  git clone --depth 1 --branch "$AVALONIA_VERSION" https://github.com/AvaloniaUI/Avalonia.git "$src"
+  git_with_retries clone --depth 1 --branch "$AVALONIA_VERSION" https://github.com/AvaloniaUI/Avalonia.git "$src"
 fi
 
 if git -C "$src" config -f .gitmodules --get-regexp path | grep -q 'external/Numerge' && [[ ! -d "$src/external/Numerge/.git" ]]; then
-  git -C "$src" submodule update --init --depth 1 external/Numerge
+  git_with_retries -C "$src" submodule update --init --depth 1 external/Numerge
 fi
 
 if [[ ! -f "$src/native/Avalonia.Native/inc/avalonia-native.h" ]]; then
