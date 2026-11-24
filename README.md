@@ -93,10 +93,10 @@ background session. Real hardware, in a GUI session, is required.
 
 ```xml
 <ItemGroup>
-  <PackageReference Include="Avalonia" Version="12.1.1" />
-  <PackageReference Include="Avalonia.Desktop" Version="12.1.1" />
-  <PackageReference Include="Avalonia.Themes.Fluent" Version="12.1.1" />
-  <PackageReference Include="Optris.StaticGraphics.Avalonia.Vulkan" Version="3.119.4.12" />
+  <PackageReference Include="Avalonia" Version="12.2.0" />
+  <PackageReference Include="Avalonia.Desktop" Version="12.2.0" />
+  <PackageReference Include="Avalonia.Themes.Fluent" Version="12.2.0" />
+  <PackageReference Include="Optris.StaticGraphics.Avalonia.Vulkan" Version="3.119.4.3" />
 </ItemGroup>
 ```
 
@@ -111,6 +111,7 @@ bindings were not compiled against.
 
 | Avalonia | SkiaSharp it depends on | package version to use |
 | --- | --- | --- |
+| 12.2.0 | 3.119.4 | `3.119.4.*` |
 | 12.1.x | 3.119.4 | `3.119.4.*` |
 | 11.3.x | 2.88.9 | not published - see below |
 
@@ -129,13 +130,11 @@ only because the package's own SkiaSharp reference is higher, so NuGet silently 
 Skia underneath it. Highest-wins does not warn, and the one test meant to prove the native layer
 works had been proving it for a pairing nobody ships.
 
-On macOS also reference `Optris.StaticGraphics.AvaloniaNative`, which carries
+On macOS a companion package, `Optris.StaticGraphics.AvaloniaNative`, carries
 `libAvaloniaNative.a`. It is tier-independent, but it contains Avalonia's own native library, so its
-version has to match the Avalonia version the application uses:
-
-```xml
-<PackageReference Include="Optris.StaticGraphics.AvaloniaNative" Version="12.1.1.1" />
-```
+version has to match the Avalonia version the application uses. It is built by this repository but
+is **not published to nuget.org** (see "Known gap: Metal on macOS" above), so a reference to it
+cannot restore. Build it from source if you need it.
 
 ## Publish
 
